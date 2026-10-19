@@ -1735,19 +1735,43 @@ function clearOsrmPickPoint() {
   }
 }
 
-function clearOsrmRouteLines() {
-  osrmLineLayer.clearLayers();
+// Yeni bir rota çizilmeden önce haritadaki önceki rota çizgilerini ve
+// durak/özel simgeleri siler. Toplu taşıma ve karayolu aynı anda kalmaz;
+// gecikmiş bir sorgu da silinmiş çizgiyi geri getirmez.
+function layerBelongsToBaseMap(layer) {
+  if (!layer) return false;
+  if (layer === projectCluster || layer === markersLayer || layer === osrmLineLayer || layer === routesLayer) return true;
+  if (markersLayer && typeof markersLayer.hasLayer === "function" && markersLayer.hasLayer(layer)) return true;
+  if (projectCluster && typeof projectCluster.hasLayer === "function" && projectCluster.hasLayer(layer)) return true;
+  const featureGroup = projectCluster && projectCluster._featureGroup;
+  if (featureGroup && typeof featureGroup.hasLayer === "function" && featureGroup.hasLayer(layer)) return true;
+  return false;
 }
 
-function clearOsrmRoute() {
+function clearMapLayers() {
   osrmRouteToken += 1;
+  routeDrawToken += 1;
   if (osrmFetchAbort) {
     osrmFetchAbort.abort();
     osrmFetchAbort = null;
   }
-  clearOsrmRouteLines();
   clearOsrmPickPoint();
-  updateOsrmPickStatus();
+  activeBoardMarker = null;
+
+  if (osrmLineLayer) osrmLineLayer.clearLayers();
+  if (routesLayer) routesLayer.clearLayers();
+
+  const stray = [];
+  map.eachLayer((layer) => {
+    if (!layer || layer instanceof L.TileLayer || layerBelongsToBaseMap(layer)) return;
+    const isRouteGraphic = layer instanceof L.Polyline || layer instanceof L.CircleMarker || layer instanceof L.Marker;
+    const isGroup = layer instanceof L.LayerGroup;
+    if (isRouteGraphic || isGroup) stray.push(layer);
+  });
+  stray.forEach((layer) => {
+    if (typeof layer.clearLayers === "function") layer.clearLayers();
+    if (map.hasLayer(layer)) map.removeLayer(layer);
+  });
 }
 
 async function drawOsrmRoute(start, end) {
@@ -1757,18 +1781,11 @@ async function drawOsrmRoute(start, end) {
     return;
   }
 
-  // Her yeni çağrı eski çizgi katmanlarını tamamen siler. Gecikmiş bir
-  // cevap, yerine yenisi çizilmiş rotanın üstüne eklenmez.
-  osrmRouteToken += 1;
+  clearMapLayers();
   const myToken = osrmRouteToken;
-  if (osrmFetchAbort) osrmFetchAbort.abort();
   const abort = new AbortController();
   osrmFetchAbort = abort;
-  clearOsrmRouteLines();
-  clearOsrmPickPoint();
-  routesLayer.clearLayers();
-  routeDrawToken += 1;
-  setBackgroundMarkersVisible(true);
+  setBackgroundMarkersVisible(false);
   updateOsrmPickStatus("Rota hesaplanıyor…");
 
   const url = `${OSRM_SERVICE_URL}/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`;
@@ -1784,7 +1801,8 @@ async function drawOsrmRoute(start, end) {
     }
     // OSRM GeoJSON [Longitude, Latitude] döner; Leaflet [Latitude, Longitude] bekler.
     const latLngs = coordinates.map(coord => [coord[1], coord[0]]);
-    clearOsrmRouteLines();
+    osrmLineLayer.clearLayers();
+    routesLayer.clearLayers();
     L.polyline(latLngs, {
       color: "#ffffff",
       weight: 8,
@@ -2254,7 +2272,8 @@ function clearResults() {
   resultsList.innerHTML = "";
   lastRouteEndpoints = null;
   if (osrmUseSelectedBtn) osrmUseSelectedBtn.classList.add("osrm-hidden");
-  routesLayer.clearLayers();
+  clearMapLayers();
+  updateOsrmPickStatus();
   routeDetail.classList.add("hidden");
   emptyState.classList.remove("hidden");
   resultsHeading.textContent = "";
@@ -2287,7 +2306,7 @@ function runSearch() {
 function renderOriginToProject(originId) {
   const rows = rankProjectsForOrigin(originId, currentThreshold);
   lastRouteEndpoints = null;
-  routesLayer.clearLayers();
+  clearMapLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
 
@@ -2345,7 +2364,7 @@ function renderOriginToProject(originId) {
 function renderProjectToOrigin(projectId) {
   const rows = rankDistrictsForProject(projectId, currentThreshold);
   lastRouteEndpoints = null;
-  routesLayer.clearLayers();
+  clearMapLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
 
@@ -2832,10 +2851,8 @@ function setBackgroundMarkersVisible(visible) {
 }
 
 function drawRoute(originCoords, row, bucket, destCoordsOverride) {
-  clearOsrmRoute();
-  routesLayer.clearLayers();
+  clearMapLayers();
   setBackgroundMarkersVisible(false);
-  routeDrawToken += 1;
   const myToken = routeDrawToken;
   const destCoords = destCoordsOverride || { lat: row.project.lat, lng: row.project.lng };
   if (isRouteLatLng(originCoords) && isRouteLatLng(destCoords)) {
