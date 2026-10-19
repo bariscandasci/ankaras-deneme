@@ -2954,176 +2954,111 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
   anchors.push(destCoords);
 
   const allPoints = [];
-  const roadBatches = [];
-  let roadPoints = [];
-  const pushRoad = (point) => {
-    if (!isRouteLatLng(point)) return;
-    const last = roadPoints[roadPoints.length - 1];
-    if (last && Math.abs(last.lat - point.lat) < 1e-5 && Math.abs(last.lng - point.lng) < 1e-5) return;
-    roadPoints.push({ lat: point.lat, lng: point.lng });
+  const routePin = (className) => L.divIcon({
+    className: "",
+    html: `<div class="pin ${className}"></div>`,
+    iconSize: [26, 26],
+    iconAnchor: [13, 26],
+  });
+  const remember = (latlngs) => {
+    allPoints.push(...latlngs);
   };
-  const flushRoad = () => {
-    if (roadPoints.length >= 2) roadBatches.push(roadPoints);
-    roadPoints = [];
+  const rideEndpoints = (step, startA, endA) => {
+    const stops = orderedStopsForStep(step);
+    if (stops && stops.length >= 2) {
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      return [
+        { lat: first.lat, lng: first.lng },
+        { lat: last.lat, lng: last.lng },
+      ];
+    }
+    return [startA, endA];
   };
 
-  // kind: "solid" (gerçek güzergah, halo'lu) | "walk" (yürüyüş, noktalı mavi,
-  // halo'suz) | "fallback" (bu bacak için gerçek geometri yok, modun kendi
-  // renginde ince kesikli — hâlâ o modun bir bacağı, sadece tahmini çizilir).
-  const drawSegment = (latlngs, kind, tooltipText) => {
-      // Google Maps tarzı "halo": renkli çizginin altına biraz daha kalın
-      // beyaz bir kontur çizgisi eklenir. Önceleri SADECE "solid" alıyordu;
-      // kullanıcı "araç/metro çizgisi yolların içinde kayboluyor" dedi ve
-      // test ettiği rotada rastlantısal olarak hiç solid bacak yoktu, hepsi
-      // "fallback"ti (geometrisi belirsiz, o zamana kadar halosuz+ince) —
-      // asıl "cılız" görünen oydu. Artık fallback da AYNI halo'yu alıyor;
-      // ikisi arasındaki fark artık sadece kesikli/katı olması (fallback
-      // hâlâ "6 6" ile "bu kısım tahmini" diyor), kalınlık/belirginlikte
-      // DEĞİL. Sadece yürüyüş (zaten kendi kalın boncuk stiliyle belirgin)
-      // halosuz kalıyor — Google da yürüyüş noktalarına halo koymuyor.
-      if (kind === "solid" || kind === "fallback") {
-        L.polyline(latlngs, {
-          color: "#ffffff",
-          weight: 7,
-          opacity: 0.9,
-          lineJoin: "round",
-          lineCap: "round",
-          interactive: false,
-        }).addTo(routesLayer);
-      }
-      // Üç bacak türü de (solid/walk/fallback) ARTIK AYNI TEK lacivertte
-      // (TRANSIT_LINE_COLOR) — ayrımı renk değil, katı/kesikli olması
-      // sağlıyor. Yürüyüş kesikli bir ÇİZGİ değil, Google Haritalar'daki
-      // gibi YUVARLAK BONCUK DİZİSİ: dashArray'in ilk değeri 0 (çizili
-      // kısım sıfır uzunlukta) + lineCap "round" birleşince, her "dash"
-      // aslında weight kadar çaplı tam bir daireye dönüşüyor.
-      const poly = L.polyline(latlngs, {
-        color: kind === "walk" ? WALK_LINE_COLOR : kind === "solid" ? TRANSIT_LINE_COLOR : FALLBACK_LINE_COLOR,
-        weight: 5,
-        opacity: 1,
-        dashArray: kind === "walk" ? "0 10" : kind === "fallback" ? "6 6" : null,
-        lineJoin: "round",
-        lineCap: "round",
-      }).addTo(routesLayer);
-      poly.bindTooltip(tooltipText, { sticky: true });
-      allPoints.push(...latlngs);
-      return poly;
-    };
-
-  // Aday, duraklar ve proje tek waypoint dizisi. OSRM bunu tek çizgi olarak
-  // döndürür; yürüyüş kesikleri ayrı polyline olmadığı için birleşimde kopukluk kalmaz.
-  pushRoad(anchors[0]);
+  // Her bacak ayrı çizilir. Yürüyüş OSRM'e gitmez. Otobüs/metro yalnızca
+  // biniş ve iniş durağıyla istenir; ara duraklar waypoint olmaz.
+  const ridePins = [];
   steps.forEach((step, i) => {
     const startA = anchors[i];
     const endA = anchors[i + 1];
-    const isBus = step.mode === "otobus" || step.mode === "dolmus";
-    const rail = step.mode === "metro" || step.mode === "ankaray" || step.mode === "tren";
+    const isWalk = step.mode === "hub";
     const tooltipText = `${MODE_ICON[step.mode] || ""} ${step.line}`;
-
-    if (rail) {
-      pushRoad(startA);
-      flushRoad();
-      const along = !isUnreliableLineSegment(step) ? rideShapeLatLngs(step) : null;
-      const shapeTrusted = along && along.length > 1 && maxJumpKm(along) <= 4;
-      if (shapeTrusted) {
-        drawSegment(along, "solid", tooltipText);
-        const segStart = { lat: along[0][0], lng: along[0][1] };
-        const segEnd = { lat: along[along.length - 1][0], lng: along[along.length - 1][1] };
-        if (haversineKm(startA, segStart) > REAL_GEOMETRY_CONNECT_LIMIT_KM) {
-          drawSegment([[startA.lat, startA.lng], [segStart.lat, segStart.lng]], "fallback", tooltipText);
-        }
-        if (haversineKm(endA, segEnd) > REAL_GEOMETRY_CONNECT_LIMIT_KM) {
-          drawSegment([[segEnd.lat, segEnd.lng], [endA.lat, endA.lng]], "fallback", tooltipText);
-        }
-      } else {
-        drawSegment([[startA.lat, startA.lng], [endA.lat, endA.lng]], "fallback", tooltipText);
-      }
-      roadPoints = [];
-      pushRoad(endA);
+    if (isWalk) {
+      if (!isRouteLatLng(startA) || !isRouteLatLng(endA)) return;
+      const latlngs = [[startA.lat, startA.lng], [endA.lat, endA.lng]];
+      L.polyline(latlngs, {
+        color: "#4285F4",
+        weight: 4,
+        opacity: 1,
+        dashArray: "5, 10",
+        lineCap: "round",
+        lineJoin: "round",
+      }).bindTooltip(tooltipText, { sticky: true }).addTo(routesLayer);
+      remember(latlngs);
       return;
     }
-
-    if (isBus) {
-      const stops = orderedStopsForStep(step);
-      if (stops && stops.length >= 2) stops.forEach((stop) => pushRoad(stop));
-      else pushRoad(endA);
-      return;
-    }
-
-    // Yürüyüş (aday → durak, durak → proje) aynı OSRM isteğinin waypoint'idir.
-    pushRoad(endA);
-  });
-  flushRoad();
-
-  const roadTip = steps
-    .filter((s) => s.mode === "hub" || s.mode === "otobus" || s.mode === "dolmus")
-    .map((s) => `${MODE_ICON[s.mode] || ""} ${s.line}`)
-    .join(" · ");
-  roadBatches.forEach((points) => {
-    const job = fetchProjectOsrmLatLngs(points, busAbort.signal).then((latlngs) => {
+    const [boardPoint, alightPoint] = rideEndpoints(step, startA, endA);
+    ridePins.push({ board: boardPoint, alight: alightPoint, step });
+    if (!isRouteLatLng(boardPoint) || !isRouteLatLng(alightPoint)) return;
+    const job = fetchProjectOsrmLatLngs([boardPoint, alightPoint], busAbort.signal).then((latlngs) => {
       if (myToken !== routeDrawToken || !latlngs || latlngs.length < 2) return;
-      drawSegment(latlngs, "solid", roadTip || "Rota");
+      L.polyline(latlngs, {
+        color: "#1a56db",
+        weight: 6,
+        opacity: 0.8,
+        lineCap: "round",
+        lineJoin: "round",
+      }).bindTooltip(tooltipText, { sticky: true }).addTo(routesLayer);
+      remember(latlngs);
     });
     osrmJobs.push(job);
   });
 
-  // Aktarma noktaları (bir bacağın bittiği/diğerinin başladığı her sınır —
-  // anchors[1..length-2], yani başlangıç ve hedefin KENDİSİ hariç) Google
-  // Haritalar tarzı içi beyaz, kenarı lacivert küçük halkalarla işaretlenir.
-  for (let i = 1; i < anchors.length - 1; i++) {
-    L.circleMarker([anchors[i].lat, anchors[i].lng], {
-      radius: 5,
-      color: TRANSIT_LINE_COLOR,
-      weight: 3,
-      fillColor: "#ffffff",
-      fillOpacity: 1,
-    }).addTo(routesLayer);
-  }
-
-  // Arka plan pinleri gizlendiği için (bkz. setBackgroundMarkersVisible),
-  // bu rotanın kendi başlangıç ve hedef noktaları ayrıca işaretlenir —
-  // aksi halde harita tamamen "çıplak" kalırdı. Başlangıç, aktarma
-  // halkalarıyla AYNI sade halka/nokta stili; hedef ise Google'daki gibi
-  // sade kırmızı bir konum pini (aday/proje/ilçe rengine bakılmaksızın).
-  L.circleMarker([originCoords.lat, originCoords.lng], {
-    radius: 6,
-    color: TRANSIT_LINE_COLOR,
-    weight: 3,
-    fillColor: "#ffffff",
-    fillOpacity: 1,
-  })
-    .bindTooltip("Başlangıç", { direction: "top" })
+  const samePoint = (a, b) => isRouteLatLng(a) && isRouteLatLng(b) && haversineKm(a, b) < 0.04;
+  L.marker([originCoords.lat, originCoords.lng], { icon: routePin("pin-origin"), zIndexOffset: 400 })
+    .bindTooltip("Aday", { direction: "top" })
     .addTo(routesLayer);
-  const destIcon = L.divIcon({ className: "", html: `<div class="pin pin-dest-flag"></div>`, iconSize: [26, 26], iconAnchor: [13, 26] });
-  const destLabel = row.project ? row.project.name : row.district ? row.district.name : "Hedef";
-  L.marker([destCoords.lat, destCoords.lng], { icon: destIcon }).bindTooltip(destLabel, { direction: "top" }).addTo(routesLayer);
+  const destLabel = row.project ? row.project.name : row.district ? row.district.name : "Proje";
+  L.marker([destCoords.lat, destCoords.lng], { icon: routePin("pin-dest-flag"), zIndexOffset: 500 })
+    .bindTooltip(destLabel, { direction: "top" })
+    .addTo(routesLayer);
 
   activeBoardMarker = null;
   const board = firstBoardContext(row);
-  if (board && board.stop && typeof board.stop.lat === "number") {
-    const staticResult = { source: "static", estimatedWaitMin: board.fallbackWaitMin };
-    const marker = L.circleMarker([board.stop.lat, board.stop.lng], {
-      radius: 8,
-      color: "#047857",
-      weight: 3,
-      fillColor: "#ffffff",
-      fillOpacity: 1,
-    }).addTo(routesLayer);
-    marker.bindTooltip(`${board.stop.name} · biniş`, { direction: "top" });
-    marker.bindPopup(liveArrivalHtml(board, staticResult, row.durationMin), { maxWidth: 280 });
-    activeBoardMarker = marker;
-    if (window.LiveBus) {
-      LiveBus.getLiveBusArrival(board.stopId, board.line.id, {
-        hatNo: board.hatNo,
-        fallbackWaitMin: board.fallbackWaitMin,
-      }).then((result) => {
-        if (myToken !== routeDrawToken || activeBoardMarker !== marker) return;
-        const activeCard = document.querySelector(".result-card-active");
-        if (activeCard) applyLiveArrival(activeCard, row, result);
-        else marker.setPopupContent(liveArrivalHtml(board, result, adjustedTripMinutes(row, board, result)));
-      });
+  const boardingPoint = board && board.stop && typeof board.stop.lat === "number"
+    ? { lat: board.stop.lat, lng: board.stop.lng }
+    : ridePins[0] && ridePins[0].board;
+  if (isRouteLatLng(boardingPoint) && !samePoint(boardingPoint, originCoords) && !samePoint(boardingPoint, destCoords)) {
+    const marker = L.marker([boardingPoint.lat, boardingPoint.lng], { icon: routePin("pin-board"), zIndexOffset: 450 })
+      .bindTooltip(board && board.stop ? `${board.stop.name} · biniş` : "Biniş", { direction: "top" })
+      .addTo(routesLayer);
+    if (board && board.stop) {
+      const staticResult = { source: "static", estimatedWaitMin: board.fallbackWaitMin };
+      marker.bindPopup(liveArrivalHtml(board, staticResult, row.durationMin), { maxWidth: 280 });
+      activeBoardMarker = marker;
+      if (window.LiveBus) {
+        LiveBus.getLiveBusArrival(board.stopId, board.line.id, {
+          hatNo: board.hatNo,
+          fallbackWaitMin: board.fallbackWaitMin,
+        }).then((result) => {
+          if (myToken !== routeDrawToken || activeBoardMarker !== marker) return;
+          const activeCard = document.querySelector(".result-card-active");
+          if (activeCard) applyLiveArrival(activeCard, row, result);
+          else marker.setPopupContent(liveArrivalHtml(board, result, adjustedTripMinutes(row, board, result)));
+        });
+      }
     }
   }
+  ridePins.slice(1).forEach((ride, index) => {
+    const point = ride.board;
+    if (!isRouteLatLng(point)) return;
+    if (samePoint(point, originCoords) || samePoint(point, destCoords) || samePoint(point, boardingPoint)) return;
+    if (ridePins.slice(1, index + 1).some((earlier) => samePoint(earlier.board, point))) return;
+    L.marker([point.lat, point.lng], { icon: routePin("pin-transfer"), zIndexOffset: 430 })
+      .bindTooltip("Aktarma", { direction: "top" })
+      .addTo(routesLayer);
+  });
 
   if (allPoints.length) {
     map.fitBounds(L.latLngBounds(allPoints), { padding: [70, 70], animate: true, duration: 0.8 });
