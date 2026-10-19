@@ -2742,6 +2742,160 @@ function rideShapeLatLngs(step) {
   return pts.length > 1 ? pts : null;
 }
 
+function orderedStopsForStep(step) {
+  if (!step.lineId || !step.fromStopId || !step.toStopId || !transitGraph) return null;
+  const line = transitGraph.linesByLocalId.get(step.lineId);
+  if (!line || !line.stopIds) return null;
+  const ids = line.stopIds;
+  const fromIndex = ids.indexOf(step.fromStopId);
+  const toIndex = ids.indexOf(step.toStopId);
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return null;
+  const ordered = [];
+  const dir = fromIndex < toIndex ? 1 : -1;
+  for (let i = fromIndex; dir > 0 ? i <= toIndex : i >= toIndex; i += dir) {
+    const stop = transitGraph.stopsById.get(ids[i]);
+    if (!stop || typeof stop.lat !== "number") return null;
+    ordered.push(stop);
+  }
+  return ordered;
+}
+
+// OSM şekli durakların arasını gerçekten dolduruyorsa onu kullan. İki durak
+// koordinatından ibaret (ya da kopuk) bir parça yol değildir; o aralık OSRM'e kalır.
+function roadPieceBetweenStops(step, prev, stop) {
+  if (isUnreliableLineSegment(step)) return null;
+  const geo = localTransitGeometry && step.lineId && localTransitGeometry[step.lineId];
+  if (!geo) return null;
+  const piece = shortGeometryBetween(geo, prev, stop);
+  if (!piece || piece.length < 3 || maxJumpKm(piece) > MAX_GEOMETRY_JUMP_KM) return null;
+  const start = { lat: piece[0][0], lng: piece[0][1] };
+  const end = { lat: piece[piece.length - 1][0], lng: piece[piece.length - 1][1] };
+  const prevPoint = { lat: prev.lat, lng: prev.lng };
+  const forward = haversineKm(prevPoint, start) <= haversineKm(prevPoint, end);
+  return forward ? piece : piece.slice().reverse();
+}
+
+// Otobüs/dolmuş bacağında düz durak-durak çizgisi yok. Yol geometrisi olan
+// aralıklar olduğu gibi kalır; olmayanlar durak dizisi halinde OSRM'e gider.
+function busRoadParts(step, startA, endA) {
+  const stops = orderedStopsForStep(step);
+  const parts = [];
+  let pending = null;
+  const flush = () => {
+    if (pending && pending.length >= 2) parts.push({ kind: "osrm", points: pending });
+    pending = null;
+  };
+  const queue = (point) => {
+    if (!isRouteLatLng(point)) return;
+    if (!pending) pending = [];
+    const last = pending[pending.length - 1];
+    if (last && Math.abs(last.lat - point.lat) < 1e-5 && Math.abs(last.lng - point.lng) < 1e-5) return;
+    pending.push({ lat: point.lat, lng: point.lng });
+  };
+
+  if (stops && stops.length >= 2) {
+    for (let i = 1; i < stops.length; i++) {
+      const prev = stops[i - 1];
+      const stop = stops[i];
+      const piece = roadPieceBetweenStops(step, prev, stop);
+      if (piece) {
+        flush();
+        parts.push({ kind: "road", latlngs: piece });
+      } else {
+        queue({ lat: prev.lat, lng: prev.lng });
+        queue({ lat: stop.lat, lng: stop.lng });
+      }
+    }
+    flush();
+    const first = { lat: stops[0].lat, lng: stops[0].lng };
+    const lastStop = stops[stops.length - 1];
+    const last = { lat: lastStop.lat, lng: lastStop.lng };
+    if (isRouteLatLng(startA) && haversineKm(startA, first) > REAL_GEOMETRY_CONNECT_LIMIT_KM) {
+      parts.unshift({ kind: "osrm", points: [{ lat: startA.lat, lng: startA.lng }, first] });
+    }
+    if (isRouteLatLng(endA) && haversineKm(endA, last) > REAL_GEOMETRY_CONNECT_LIMIT_KM) {
+      parts.push({ kind: "osrm", points: [last, { lat: endA.lat, lng: endA.lng }] });
+    }
+    return parts;
+  }
+
+  if (isRouteLatLng(startA) && isRouteLatLng(endA)) {
+    return [{ kind: "osrm", points: [{ lat: startA.lat, lng: startA.lng }, { lat: endA.lat, lng: endA.lng }] }];
+  }
+  return [];
+}
+
+const projectOsrmCache = new Map();
+
+function osrmWaypointKey(points) {
+  return points.map((p) => `${p.lng.toFixed(5)},${p.lat.toFixed(5)}`).join(";");
+}
+
+async function fetchProjectOsrmOnce(points, signal) {
+  const key = osrmWaypointKey(points);
+  if (projectOsrmCache.has(key)) return projectOsrmCache.get(key);
+  const promise = (async () => {
+    try {
+      const timeout = AbortSignal.timeout(8000);
+      const used = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const path = points.map((p) => `${p.lng},${p.lat}`).join(";");
+      const url = `${OSRM_SERVICE_URL}/${path}?overview=full&geometries=geojson`;
+      const res = await fetch(url, { signal: used });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const coordinates = data && data.routes && data.routes[0] && data.routes[0].geometry && data.routes[0].geometry.coordinates;
+      if (!coordinates || coordinates.length < 2) return null;
+      return coordinates.map((coord) => [coord[1], coord[0]]);
+    } catch (e) {
+      return null;
+    }
+  })();
+  projectOsrmCache.set(key, promise);
+  promise.then((result) => {
+    if (!result) projectOsrmCache.delete(key);
+  });
+  return promise;
+}
+
+// Durak dizisini tek istekte yollara oturtur. İstek başarısız olursa her
+// durak çifti ayrı istenir; düz kuş uçuşu çizgiye dönülmez.
+async function fetchProjectOsrmLatLngs(points, signal) {
+  const cleaned = [];
+  for (const p of points) {
+    if (!isRouteLatLng(p)) continue;
+    const last = cleaned[cleaned.length - 1];
+    if (last && Math.abs(last.lat - p.lat) < 1e-5 && Math.abs(last.lng - p.lng) < 1e-5) continue;
+    cleaned.push({ lat: p.lat, lng: p.lng });
+  }
+  if (cleaned.length < 2) return null;
+  if (cleaned.length > 40) {
+    const merged = [];
+    for (let i = 0; i < cleaned.length - 1; ) {
+      const end = Math.min(cleaned.length, i + 25);
+      const latlngs = await fetchProjectOsrmLatLngs(cleaned.slice(i, end), signal);
+      if (latlngs && latlngs.length > 1) {
+        if (merged.length) latlngs.shift();
+        merged.push(...latlngs);
+      }
+      if (end >= cleaned.length) break;
+      i = end - 1;
+    }
+    return merged.length > 1 ? merged : null;
+  }
+  const direct = await fetchProjectOsrmOnce(cleaned, signal);
+  if (direct) return direct;
+  if ((signal && signal.aborted) || cleaned.length === 2) return null;
+  const segs = await Promise.all(
+    cleaned.slice(1).map((point, index) => fetchProjectOsrmOnce([cleaned[index], point], signal))
+  );
+  const merged = [];
+  segs.forEach((seg) => {
+    if (!seg || seg.length < 2) return;
+    merged.push(...(merged.length ? seg.slice(1) : seg));
+  });
+  return merged.length > 1 ? merged : null;
+}
+
 // Yürüyüş bacakları eskiden iki nokta arası DÜZ çizgiyle ("kuş uçuşu")
 // çiziliyordu — kullanıcı haklı olarak "yürüyen kişi binaların üstünden mi
 // atlayacak" diye sordu. transit_network.json'da yaya kaldırım/patika verisi
@@ -2824,6 +2978,8 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
   clearRouteLayers();
   setBackgroundMarkersVisible(false);
   const myToken = routeDrawToken;
+  const busAbort = new AbortController();
+  osrmFetchAbort = busAbort;
   const destCoords = destCoordsOverride || { lat: row.project.lat, lng: row.project.lng };
   if (isRouteLatLng(originCoords) && isRouteLatLng(destCoords)) {
     lastRouteEndpoints = {
@@ -2834,6 +2990,7 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
   }
   const steps = row.steps || [];
   if (steps.length === 0) return;
+  const osrmJobs = [];
 
   const lineOfStep = (s) => (s.lineId ? linesById[s.lineId] : null);
   // Gerçek graf motorunun ürettiği adımlardaki lineId'ler linesById'de değil
@@ -2939,7 +3096,25 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
       return poly;
     };
 
+    const isBus = step.mode === "otobus" || step.mode === "dolmus";
     const rail = step.mode === "metro" || step.mode === "ankaray" || step.mode === "tren";
+    if (isBus) {
+      // Duraklar arasında düz çizgi yok. Parça, OSRM karayolu geometrisi
+      // gelince caddeleri takip eden katı çizgi olarak eklenir.
+      busRoadParts(step, startA, endA).forEach((part) => {
+        if (part.kind === "road") {
+          drawSegment(part.latlngs, "solid");
+          return;
+        }
+        const job = fetchProjectOsrmLatLngs(part.points, busAbort.signal).then((latlngs) => {
+          if (myToken !== routeDrawToken || !latlngs || latlngs.length < 2) return;
+          drawSegment(latlngs, "solid");
+        });
+        osrmJobs.push(job);
+      });
+      return;
+    }
+
     const along = !isWalk && !isUnreliableLineSegment(step) ? rideShapeLatLngs(step) : null;
     const jumpLimit = rail ? 4 : MAX_GEOMETRY_JUMP_KM;
     const shapeTrusted = along && along.length > 1 && maxJumpKm(along) <= jumpLimit;
@@ -2958,8 +3133,6 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
         drawSegment([[segEnd.lat, segEnd.lng], [endA.lat, endA.lng]], "fallback");
       }
     } else {
-      // Güvenilir durak-sıralı şekil yoksa toplu taşıma kendi çizgisini kullanır.
-      // OSRM burada çağrılmaz; karayolu rotası yalnızca "Yol rotası" ile çizilir.
       drawSegment([[startA.lat, startA.lng], [endA.lat, endA.lng]], isWalk ? "walk" : "fallback");
     }
   });
@@ -3024,6 +3197,12 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
 
   if (allPoints.length) {
     map.fitBounds(L.latLngBounds(allPoints), { padding: [70, 70], animate: true, duration: 0.8 });
+  }
+  if (osrmJobs.length) {
+    Promise.all(osrmJobs).then(() => {
+      if (myToken !== routeDrawToken || allPoints.length < 2) return;
+      map.fitBounds(L.latLngBounds(allPoints), { padding: [70, 70], animate: true, duration: 0.6 });
+    });
   }
 }
 
