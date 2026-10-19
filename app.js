@@ -1735,20 +1735,9 @@ function clearOsrmPickPoint() {
   }
 }
 
-// Yeni bir rota çizilmeden önce haritadaki önceki rota çizgilerini ve
-// durak/özel simgeleri siler. Toplu taşıma ve karayolu aynı anda kalmaz;
-// gecikmiş bir sorgu da silinmiş çizgiyi geri getirmez.
-function layerBelongsToBaseMap(layer) {
-  if (!layer) return false;
-  if (layer === projectCluster || layer === markersLayer || layer === osrmLineLayer || layer === routesLayer) return true;
-  if (markersLayer && typeof markersLayer.hasLayer === "function" && markersLayer.hasLayer(layer)) return true;
-  if (projectCluster && typeof projectCluster.hasLayer === "function" && projectCluster.hasLayer(layer)) return true;
-  const featureGroup = projectCluster && projectCluster._featureGroup;
-  if (featureGroup && typeof featureGroup.hasLayer === "function" && featureGroup.hasLayer(layer)) return true;
-  return false;
-}
-
-function clearMapLayers() {
+// Yalnızca rota çizgilerini ve rota duraklarını siler. Proje pinleri
+// projectMarkersGroup içindedir ve bu fonksiyona dahil değildir.
+function clearRouteLayers() {
   osrmRouteToken += 1;
   routeDrawToken += 1;
   if (osrmFetchAbort) {
@@ -1757,21 +1746,8 @@ function clearMapLayers() {
   }
   clearOsrmPickPoint();
   activeBoardMarker = null;
-
   if (osrmLineLayer) osrmLineLayer.clearLayers();
   if (routesLayer) routesLayer.clearLayers();
-
-  const stray = [];
-  map.eachLayer((layer) => {
-    if (!layer || layer instanceof L.TileLayer || layerBelongsToBaseMap(layer)) return;
-    const isRouteGraphic = layer instanceof L.Polyline || layer instanceof L.CircleMarker || layer instanceof L.Marker;
-    const isGroup = layer instanceof L.LayerGroup;
-    if (isRouteGraphic || isGroup) stray.push(layer);
-  });
-  stray.forEach((layer) => {
-    if (typeof layer.clearLayers === "function") layer.clearLayers();
-    if (map.hasLayer(layer)) map.removeLayer(layer);
-  });
 }
 
 async function drawOsrmRoute(start, end) {
@@ -1781,11 +1757,10 @@ async function drawOsrmRoute(start, end) {
     return;
   }
 
-  clearMapLayers();
+  clearRouteLayers();
   const myToken = osrmRouteToken;
   const abort = new AbortController();
   osrmFetchAbort = abort;
-  setBackgroundMarkersVisible(false);
   updateOsrmPickStatus("Rota hesaplanıyor…");
 
   const url = `${OSRM_SERVICE_URL}/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`;
@@ -1924,7 +1899,7 @@ osrmPickControl.addTo(map);
 
 // Proje pinleri (53 adet) çok kalabalık olduğundan (ör. Bilkent'te 15+ proje
 // üst üste biniyor) kümeleme kullanıyoruz: yakınlaşınca otomatik ayrışırlar.
-const projectCluster = L.markerClusterGroup({
+const projectMarkersGroup = L.markerClusterGroup({
   maxClusterRadius: 45,
   spiderfyOnMaxZoom: true,
   showCoverageOnHover: false,
@@ -1944,17 +1919,17 @@ function buildProjectMarker(p) {
   m.bindTooltip(`${isUrgent ? "🔴 ACİL — " : ""}${p.name} — ${p.address}`, { direction: "top" });
   projectMarkersById[p.id] = m;
   if (!INACTIVE_PROJECT_IDS.has(p.id)) {
-    projectCluster.addLayer(m);
+    projectMarkersGroup.addLayer(m);
   }
   return m;
 }
 ANKARA_DATA.projects.forEach(buildProjectMarker);
-map.addLayer(projectCluster);
+map.addLayer(projectMarkersGroup);
 
 // Proje listesi kökten değiştiğinde (Sheet'ten canlı veri geldiğinde ya da
 // yeni bir proje eklendiğinde) tüm pinleri sıfırdan kurar.
 function rebuildAllProjectMarkers() {
-  projectCluster.clearLayers();
+  projectMarkersGroup.clearLayers();
   Object.keys(projectMarkersById).forEach((id) => delete projectMarkersById[id]);
   ANKARA_DATA.projects.forEach(buildProjectMarker);
 }
@@ -1970,11 +1945,11 @@ function refreshProjectMarkers() {
     const isUrgent = URGENT_PROJECT_IDS.has(p.id);
     marker.setIcon(isUrgent ? urgentProjectIcon : projectIcon);
     marker.setTooltipContent(`${isUrgent ? "🔴 ACİL — " : ""}${p.name} — ${p.address}`);
-    const inCluster = projectCluster.hasLayer(marker);
+    const inCluster = projectMarkersGroup.hasLayer(marker);
     if (isActive && !inCluster) {
-      projectCluster.addLayer(marker);
+      projectMarkersGroup.addLayer(marker);
     } else if (!isActive && inCluster) {
-      projectCluster.removeLayer(marker);
+      projectMarkersGroup.removeLayer(marker);
     }
   });
 }
@@ -2272,7 +2247,7 @@ function clearResults() {
   resultsList.innerHTML = "";
   lastRouteEndpoints = null;
   if (osrmUseSelectedBtn) osrmUseSelectedBtn.classList.add("osrm-hidden");
-  clearMapLayers();
+  clearRouteLayers();
   updateOsrmPickStatus();
   routeDetail.classList.add("hidden");
   emptyState.classList.remove("hidden");
@@ -2306,7 +2281,7 @@ function runSearch() {
 function renderOriginToProject(originId) {
   const rows = rankProjectsForOrigin(originId, currentThreshold);
   lastRouteEndpoints = null;
-  clearMapLayers();
+  clearRouteLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
 
@@ -2364,7 +2339,7 @@ function renderOriginToProject(originId) {
 function renderProjectToOrigin(projectId) {
   const rows = rankDistrictsForProject(projectId, currentThreshold);
   lastRouteEndpoints = null;
-  clearMapLayers();
+  clearRouteLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
 
@@ -2834,24 +2809,19 @@ function fetchDrivingGeometry(a, b) {
 // değilse sessizce yok sayılır.
 let routeDrawToken = 0;
 
-// Bir rota çizildiğinde, haritadaki DİĞER tüm proje/ilçe pinleri (projectCluster
-// + markersLayer) rotayı boğan bir "pin kirliliği" oluşturuyordu (2026-09-25,
-// kullanıcı raporu) — arka plandaki bu pinler geçici olarak gizlenir, sadece
-// bu rotanın kendi başlangıç/hedef pinleri (drawRoute'un sonunda eklenir)
-// görünür kalır. clearResults() (kullanıcı seçimi tamamen kaldırdığında)
-// bunları geri açar.
+// İlçe sonuç pinleri rota çizilirken gizlenebilir. Proje pinleri
+// projectMarkersGroup içindedir ve haritada sabit kalır.
 function setBackgroundMarkersVisible(visible) {
+  if (projectMarkersGroup && !map.hasLayer(projectMarkersGroup)) map.addLayer(projectMarkersGroup);
   if (visible) {
-    if (!map.hasLayer(projectCluster)) map.addLayer(projectCluster);
     if (!map.hasLayer(markersLayer)) map.addLayer(markersLayer);
-  } else {
-    if (map.hasLayer(projectCluster)) map.removeLayer(projectCluster);
-    if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+  } else if (map.hasLayer(markersLayer)) {
+    map.removeLayer(markersLayer);
   }
 }
 
 function drawRoute(originCoords, row, bucket, destCoordsOverride) {
-  clearMapLayers();
+  clearRouteLayers();
   setBackgroundMarkersVisible(false);
   const myToken = routeDrawToken;
   const destCoords = destCoordsOverride || { lat: row.project.lat, lng: row.project.lng };
@@ -2925,8 +2895,6 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
     const endA = anchors[i + 1];
     const isWalk = step.mode === "hub";
     const tooltipText = `${MODE_ICON[step.mode] || ""} ${step.line}`;
-    let walkPolyToUpgrade = null; // yürüyüş bacağıysa: gerçek sokak rotası gelince setLatLngs ile güncellenecek polyline
-    let fallbackPolyToUpgrade = null; // güvenilmez/geometrisiz araç bacağıysa: gerçek araç rotası gelince güncellenecek polyline
 
     // kind: "solid" (gerçek güzergah, halo'lu) | "walk" (yürüyüş, noktalı mavi,
     // halo'suz) | "fallback" (bu bacak için gerçek geometri yok, modun kendi
@@ -2990,33 +2958,9 @@ function drawRoute(originCoords, row, bucket, destCoordsOverride) {
         drawSegment([[segEnd.lat, segEnd.lng], [endA.lat, endA.lng]], "fallback");
       }
     } else {
-      // Güvenilir durak-sıralı şekil yok (kopuk geometri, elle işaretli
-      // bozuk bacak, ya da yürüyüş). Düz çizgi yer tutucu; yürüyüş ve
-      // otobüs bacakları sokak rotasına yükseltilir. Metro/Ankaray/tren
-      // asla araba rotasıyla çizilmez — ray caddenin üzerinden gitmez.
-      const poly = drawSegment([[startA.lat, startA.lng], [endA.lat, endA.lng]], isWalk ? "walk" : "fallback");
-      if (isWalk) walkPolyToUpgrade = poly;
-      else if (!rail) fallbackPolyToUpgrade = poly;
-    }
-
-    // Düz "kuş uçuşu" çizgi sadece anlık bir yer tutucu — kullanıcı binaların
-    // üzerinden mi yürüyecek diye haklı olarak sorabilir. Gerçek, sokakları
-    // takip eden yaya rotası geldiğinde AYNI polyline yerinde güncellenir
-    // (bkz. fetchWalkGeometry'nin başındaki not).
-    if (isWalk && walkPolyToUpgrade) {
-      fetchWalkGeometry(startA, endA).then((coords) => {
-        if (myToken !== routeDrawToken || !coords) return;
-        walkPolyToUpgrade.setLatLngs(coords);
-      });
-    }
-    // Aynı mantık, araç profiliyle: geometrisi olmayan/güvenilmez bulunan bir
-    // otobüs/metro bacağı da artık binaları kesen düz bir çizgi yerine,
-    // caddeleri takip eden bir ARAÇ rotasına yükseltilir (bkz. fetchDrivingGeometry).
-    if (!isWalk && fallbackPolyToUpgrade) {
-      fetchDrivingGeometry(startA, endA).then((coords) => {
-        if (myToken !== routeDrawToken || !coords) return;
-        fallbackPolyToUpgrade.setLatLngs(coords);
-      });
+      // Güvenilir durak-sıralı şekil yoksa toplu taşıma kendi çizgisini kullanır.
+      // OSRM burada çağrılmaz; karayolu rotası yalnızca "Yol rotası" ile çizilir.
+      drawSegment([[startA.lat, startA.lng], [endA.lat, endA.lng]], isWalk ? "walk" : "fallback");
     }
   });
 
