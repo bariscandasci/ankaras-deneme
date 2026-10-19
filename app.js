@@ -1678,14 +1678,15 @@ function districtIcon(color) {
 let markersLayer = L.layerGroup().addTo(map);
 let routesLayer = L.layerGroup().addTo(map);
 
-// Gerçek yol ağını takip eden OSRM rotası (leaflet-routing-machine).
-// Başlangıç/bitiş ya hazır koordinat olarak ya da haritaya tıklanan iki
-// nokta olarak verilir. Her yeni çizimde önce eski kontrol (ve onun
-// çizgisi) kaldırılır, sonra sıfırdan bir rota kurulur — önceki çizgi
-// ekranda kalmaz.
+// Gerçek yol ağını takip eden OSRM rotası. leaflet-routing-machine'in
+// L.Routing.control paneli kullanılmaz: o kontrol haritaya kendi çizgilerini
+// ve tutamaçlarını ekliyordu. Geometri doğrudan OSRM GeoJSON'undan alınır.
+// OSRM koordinatı [boylam, enlem] döndürür; Leaflet [enlem, boylam] bekler.
 const OSRM_ROUTE_COLOR = "#1a56db";
-const OSRM_SERVICE_URL = "https://routing.openstreetmap.de/routed-car/route/v1";
-let osrmRoutingControl = null;
+const OSRM_SERVICE_URL = "https://router.project-osrm.org/route/v1/driving";
+const osrmLineLayer = L.layerGroup().addTo(map);
+let osrmRouteToken = 0;
+let osrmFetchAbort = null;
 let osrmPickEnabled = false;
 let osrmClickPoints = [];
 let osrmPickMarker = null;
@@ -1711,7 +1712,7 @@ function updateOsrmPickStatus(message) {
   if (!osrmPickStatusEl) return;
   // Seçim modu kapanınca hesaplanmış mesafe yazısı durur. Rota haritadan
   // kalkınca (clearOsrmRoute) özet de silinir.
-  if (message == null && !osrmPickEnabled && osrmRoutingControl) return;
+  if (message == null && !osrmPickEnabled && osrmLineLayer.getLayers().length) return;
   let text = message || "";
   if (!text && osrmPickEnabled) {
     text = osrmClickPoints.length === 0
@@ -1734,129 +1735,83 @@ function clearOsrmPickPoint() {
   }
 }
 
-function removeOsrmRoutingControl() {
-  const control = osrmRoutingControl;
-  if (!control) return;
-  osrmRoutingControl = null;
-  if (control._osrmGuard) control._osrmGuard.generation += 1;
-  try {
-    map.removeControl(control);
-  } catch (e) {
-    // Kontrol zaten haritadan kalkmış olabilir.
-  }
+function clearOsrmRouteLines() {
+  osrmLineLayer.clearLayers();
 }
 
 function clearOsrmRoute() {
-  removeOsrmRoutingControl();
+  osrmRouteToken += 1;
+  if (osrmFetchAbort) {
+    osrmFetchAbort.abort();
+    osrmFetchAbort = null;
+  }
+  clearOsrmRouteLines();
   clearOsrmPickPoint();
   updateOsrmPickStatus();
 }
 
-function drawOsrmRoute(start, end) {
-  if (typeof L.Routing === "undefined" || !L.Routing.control || !L.Routing.osrmv1) return;
+async function drawOsrmRoute(start, end) {
   if (!isRouteLatLng(start) || !isRouteLatLng(end)) return;
   if (Math.abs(start.lat - end.lat) < 1e-5 && Math.abs(start.lng - end.lng) < 1e-5) {
     updateOsrmPickStatus("Bitiş, başlangıçtan farklı bir nokta olmalı.");
     return;
   }
 
-  // Eski karayolu rotasını ve varsa toplu taşıma çizgisini kaldır, sonra
-  // yalnızca bu yeni rotayı kur. Gecikmiş yürüyüş/araç geometrisi cevabı
-  // artık ekranda olmayan bir çizgiyi güncellemesin.
-  removeOsrmRoutingControl();
+  // Her yeni çağrı eski çizgi katmanlarını tamamen siler. Gecikmiş bir
+  // cevap, yerine yenisi çizilmiş rotanın üstüne eklenmez.
+  osrmRouteToken += 1;
+  const myToken = osrmRouteToken;
+  if (osrmFetchAbort) osrmFetchAbort.abort();
+  const abort = new AbortController();
+  osrmFetchAbort = abort;
+  clearOsrmRouteLines();
   clearOsrmPickPoint();
   routesLayer.clearLayers();
   routeDrawToken += 1;
   setBackgroundMarkersVisible(true);
-
-  const guard = { generation: 0 };
-  const innerRouter = L.Routing.osrmv1({
-    serviceUrl: OSRM_SERVICE_URL,
-    profile: "driving",
-    timeout: 12000,
-    suppressDemoServerWarning: true,
-    useHints: false,
-  });
-  const router = {
-    route(waypoints, callback, context, options) {
-      const generation = guard.generation;
-      return innerRouter.route(waypoints, function (err, routes) {
-        if (generation !== guard.generation) return;
-        callback.call(context, err, routes);
-      }, context, options);
-    },
-    requiresMoreDetail(route, zoom, bounds) {
-      return innerRouter.requiresMoreDetail(route, zoom, bounds);
-    },
-  };
-
   updateOsrmPickStatus("Rota hesaplanıyor…");
-  const control = L.Routing.control({
-    waypoints: [L.latLng(start.lat, start.lng), L.latLng(end.lat, end.lng)],
-    router,
-    lineOptions: {
-      styles: [
-        { color: "#ffffff", opacity: 0.95, weight: 9 },
-        { color: OSRM_ROUTE_COLOR, opacity: 1, weight: 5 },
-      ],
-      // OSRM noktayı en yakın yola çeker. İşaretle yol arasındaki kısa
-      // bağ da aynı mavi çizgi olsun; kütüphanenin gri varsayılanı
-      // rotadan kopuk bir kanca gibi duruyordu.
-      missingRouteStyles: [
-        { color: "#ffffff", opacity: 0.95, weight: 9 },
-        { color: OSRM_ROUTE_COLOR, opacity: 1, weight: 5 },
-      ],
-      addWaypoints: false,
-    },
-    altLineOptions: { styles: [{ opacity: 0, weight: 0 }] },
-    fitSelectedRoutes: false,
-    show: false,
-    collapsible: false,
-    addWaypoints: false,
-    draggableWaypoints: false,
-    routeWhileDragging: false,
-    showAlternatives: false,
-    useZoomParameter: false,
-    createMarker(index, waypoint) {
-      const isStart = index === 0;
-      return L.circleMarker(waypoint.latLng, {
-        radius: 7,
-        color: isStart ? OSRM_ROUTE_COLOR : "#ea4335",
-        weight: 3,
-        fillColor: "#ffffff",
-        fillOpacity: 1,
-      }).bindTooltip(isStart ? "Başlangıç" : "Bitiş", { direction: "top" });
-    },
-  });
-  control._osrmGuard = guard;
-  control.on("routesfound", (event) => {
-    if (osrmRoutingControl !== control) return;
-    const route = event.routes && event.routes[0];
-    const coords = route && route.coordinates;
-    if (coords && coords.length > 1) {
-      map.fitBounds(L.latLngBounds(coords), { padding: [70, 70], animate: true, duration: 0.8 });
-    }
-    if (route && route.summary) {
-      const km = (route.summary.totalDistance / 1000).toLocaleString("tr-TR", {
-        minimumFractionDigits: 1,
-        maximumFractionDigits: 1,
-      });
-      const minutes = Math.max(1, Math.round(route.summary.totalTime / 60));
-      updateOsrmPickStatus(`Karayolu rotası · ${km} km · ~${minutes} dk`);
-    } else {
-      updateOsrmPickStatus("Karayolu rotası çizildi.");
-    }
-  });
-  control.on("routingerror", () => {
-    if (osrmRoutingControl !== control) return;
-    updateOsrmPickStatus("Bu noktalar arasında yol rotası bulunamadı.");
-  });
-  osrmRoutingControl = control;
+
+  const url = `${OSRM_SERVICE_URL}/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`;
   try {
-    control.addTo(map);
+    const res = await fetch(url, { signal: abort.signal });
+    if (!res.ok) throw new Error("osrm");
+    const data = await res.json();
+    if (myToken !== osrmRouteToken) return;
+    const coordinates = data && data.routes && data.routes[0] && data.routes[0].geometry && data.routes[0].geometry.coordinates;
+    if (!coordinates || coordinates.length < 2) {
+      updateOsrmPickStatus("Bu noktalar arasında yol rotası bulunamadı.");
+      return;
+    }
+    // OSRM GeoJSON [Longitude, Latitude] döner; Leaflet [Latitude, Longitude] bekler.
+    const latLngs = coordinates.map(coord => [coord[1], coord[0]]);
+    clearOsrmRouteLines();
+    L.polyline(latLngs, {
+      color: "#ffffff",
+      weight: 8,
+      opacity: 0.95,
+      lineJoin: "round",
+      lineCap: "round",
+      interactive: false,
+    }).addTo(osrmLineLayer);
+    L.polyline(latLngs, {
+      color: "#1a56db",
+      weight: 5,
+      opacity: 1,
+      lineJoin: "round",
+      lineCap: "round",
+    }).addTo(osrmLineLayer);
+    map.fitBounds(L.latLngBounds(latLngs), { padding: [70, 70], animate: true, duration: 0.8 });
+    const summary = data.routes[0];
+    const km = (summary.distance / 1000).toLocaleString("tr-TR", {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    });
+    const minutes = Math.max(1, Math.round(summary.duration / 60));
+    updateOsrmPickStatus(`Karayolu rotası · ${km} km · ~${minutes} dk`);
   } catch (e) {
-    osrmRoutingControl = null;
-    updateOsrmPickStatus("Rota çizilemedi.");
+    if (e && e.name === "AbortError") return;
+    if (myToken !== osrmRouteToken) return;
+    updateOsrmPickStatus("Bu noktalar arasında yol rotası bulunamadı.");
   }
 }
 
