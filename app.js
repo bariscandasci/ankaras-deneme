@@ -202,6 +202,17 @@ function roundTo5(n) {
 // itirazı artık geçerli değil (Etlik→Bilkent Center hâlâ metro tabanlı, Etlik→
 // Medical Park hâlâ 261→480 — doğrulandı). Pursaklar→Nazende 139→120 dk.
 const MODE_SPEED_KMH = { otobus: 20, metro: 33, ankaray: 33, tren: 45, dolmus: 20 };
+// Metro trafikten etkilenmez. Segment süresi 0.65 ile çarpılır: otobüse göre
+// yaklaşık %40-50 daha hızlı bir maliyet (0.6-0.7 bandı). M1-M4 hatları
+// mode "metro" olarak gelir; hat kodu da ayrıca tanınır.
+const METRO_TIME_FACTOR = 0.65;
+function isMetroRide(mode, hatNo) {
+  if (mode === "metro") return true;
+  return /^M[1-4]/i.test(String(hatNo || ""));
+}
+function isBusRide(mode) {
+  return mode === "otobus" || mode === "dolmus";
+}
 // Havalimanı ekspresi (442) ve D140 / Özal Bulvarı üzerindeki uzun etaplar
 // şehir içi 20 km/s ile gidilmez — durak arası birkaç kilometre, ışıksız
 // arter. 48 km/s, istenen 45-50 bandının ortası. Kısa (2.2 km altı) durak
@@ -259,6 +270,23 @@ const LINE_HEADWAY_MIN = {
 // 2-3 gereksiz aktarmalı dolaşma seçilmesin. Gösterilen bekleme bunun dışında,
 // hattın kendi sefer aralığının yarısıdır.
 const PRIMARY_TRANSFER_PENALTY_MIN = 8;
+// Otobüs → metro aktarması ucuz, otobüs → otobüs aktarması daha pahalı.
+// Böylece uzun tek otobüs (602 gibi) yerine yakındaki metroya geçiş seçilir.
+// İlk biniş metroya da aynı düşük cezayla başlar. "En Az Aktarmalı" araması
+// çok büyük düz ceza gönderir; o çağrıda moda bakılmaz.
+const BUS_TO_METRO_TRANSFER_PENALTY_MIN = 2;
+const BUS_TO_BUS_TRANSFER_PENALTY_MIN = 14;
+function selectiveTransferPenalty(basePenalty, fromMode, toMode) {
+  if (basePenalty >= 100) return basePenalty;
+  const toMetro = isMetroRide(toMode);
+  const fromBus = isBusRide(fromMode);
+  const toBus = isBusRide(toMode);
+  if (!fromMode) return toMetro ? BUS_TO_METRO_TRANSFER_PENALTY_MIN : basePenalty;
+  if (fromBus && toMetro) return BUS_TO_METRO_TRANSFER_PENALTY_MIN;
+  if (fromBus && toBus) return BUS_TO_BUS_TRANSFER_PENALTY_MIN;
+  if (toMetro) return Math.min(basePenalty, 4);
+  return basePenalty;
+}
 // Güneybatı çevre yolu / bulvar bağlantıları (İncek, Ahlatlıbel, Konya yolu,
 // Eskişehir yolu, Koru-Yargıtay). Şehir içi 20 km/s bu koridorda 8-10 km'lik
 // işe gidişi 90 dk yapıyordu. 50 km/s, 45-50 bandının üstü; 3.8 km'den uzun
@@ -495,7 +523,8 @@ function buildTransitGraph(network, options) {
       const oho = !arterial && !boulevard && isOhoCorridorLine(line) && km <= OHO_CORRIDOR_EDGE_MAX_KM;
       const speed = arterial ? ARTERIAL_BUS_SPEED_KMH : boulevard ? BOULEVARD_BUS_SPEED_KMH : oho ? OHO_CORRIDOR_SPEED_KMH : MODE_SPEED_KMH[line.mode] || MODE_SPEED_KMH.otobus;
       const dwell = boulevard ? BOULEVARD_DWELL_MIN : oho ? OHO_CORRIDOR_DWELL_MIN : STOP_DWELL_MIN;
-      const minutes = (km / speed) * 60 + dwell;
+      let minutes = (km / speed) * 60 + dwell;
+      if (isMetroRide(line.mode, line.hatNo)) minutes *= METRO_TIME_FACTOR;
       const headwayMin = lineHeadwayMin(line);
       addEdge(a.id, b.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo);
       addEdge(b.id, a.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo);
@@ -610,7 +639,7 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       dist.set(key, startMinutes);
       realDist.set(key, realStartMinutes);
       keyStopId.set(key, stopId);
-      heap.push({ stopId, lineKey: NONE, minutes: startMinutes, rideHat: null });
+      heap.push({ stopId, lineKey: NONE, minutes: startMinutes, rideHat: null, rideMode: null });
       relaxBestAtStop(stopId, key, startMinutes, realStartMinutes);
     }
   });
@@ -640,12 +669,20 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       } else {
         newLineKey = NONE;
       }
-      const penalty = boarding ? transferPenaltyMin : 0;
       // Kısa yürüyüş aktarması hat durumunu sıfırlar; bir önceki binişin hat
       // numarasını ayrıca taşıyoruz ki 178-3 → yürüyüş → 607 gibi halka
-      // bağları cezayı atlatamasın. Bu alan durum anahtarına girmez.
+      // bağları cezayı atlatamasın. Mod da aynı şekilde taşınır: otobüsten
+      // metroya inen ceza, otobüsten otobüse inen cezadan düşüktür.
       let nextRideHat = cur.rideHat || null;
+      let nextRideMode = cur.rideMode || null;
+      let penalty = 0;
       let chainPenalty = 0;
+      if (boarding) {
+        penalty = selectiveTransferPenalty(transferPenaltyMin, nextRideMode, e.mode);
+        nextRideMode = e.mode || nextRideMode;
+      } else if (e.lineId && e.mode) {
+        nextRideMode = e.mode;
+      }
       if (e.lineId && e.hatNo) {
         if (boarding) chainPenalty = inceKChainPenalty(nextRideHat, e.hatNo, originCoords);
         nextRideHat = e.hatNo;
@@ -659,7 +696,7 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
         realDist.set(newKey, newRealMinutes);
         keyStopId.set(newKey, e.to);
         prev.set(newKey, { fromKey: curKey, lineId: e.lineId, mode: e.mode });
-        heap.push({ stopId: e.to, lineKey: newLineKey, minutes: newMinutes, rideHat: nextRideHat });
+        heap.push({ stopId: e.to, lineKey: newLineKey, minutes: newMinutes, rideHat: nextRideHat, rideMode: nextRideMode });
         relaxBestAtStop(e.to, newKey, newMinutes, newRealMinutes);
       }
     });
@@ -997,7 +1034,7 @@ function buildMinTransfersAlternative(origin, dest, originLabel, destLabel, prim
 // ---------------------------------------------------------------------------
 
 const TransitCache = {
-  KEY: "ik_ulasim_cache_v31", // v31: kapı durağı önceliği, İncek halkası seçim cezası. v30: sefer aralığı / 2.
+  KEY: "ik_ulasim_cache_v32", // v32: metro segment süresi 0.65, otobüs-metro aktarma cezası düşük. v31: kapı durağı önceliği.
   _mem: null,
   _load() {
     if (this._mem) return this._mem;
@@ -1539,7 +1576,7 @@ function rankProjectsForOrigin(originId, thresholdMin = null) {
     const aUrgent = URGENT_PROJECT_IDS.has(a.project.id) ? 1 : 0;
     const bUrgent = URGENT_PROJECT_IDS.has(b.project.id) ? 1 : 0;
     if (aUrgent !== bUrgent) return bUrgent - aUrgent;
-    return a.durationMin - b.durationMin;
+    return fastestRankScore(a) - fastestRankScore(b);
   });
   return thresholdMin ? rows.filter((r) => r.durationMin <= thresholdMin) : rows;
 }
@@ -1562,8 +1599,19 @@ function rankDistrictsForProject(projectId, thresholdMin = null) {
     return { district: d, dest, ...estimate };
   });
 
-  rows.sort((a, b) => a.durationMin - b.durationMin);
+  rows.sort((a, b) => fastestRankScore(a) - fastestRankScore(b));
   return thresholdMin ? rows.filter((r) => r.durationMin <= thresholdMin) : rows;
+}
+
+// Sıralama skoru. Metro içeren rota, gösterilen süreye göre biraz öne alınır;
+// süre etiketi değişmez, sadece "En Hızlı" sırası metro lehinedir.
+const METRO_RANK_FACTOR = 0.8;
+function routeUsesMetro(row) {
+  return (row.steps || []).some((step) => isMetroRide(step.mode, step.line));
+}
+function fastestRankScore(row) {
+  const minutes = Number(row.durationMin) || 0;
+  return routeUsesMetro(row) ? minutes * METRO_RANK_FACTOR : minutes;
 }
 
 function durationBucket(min) {
