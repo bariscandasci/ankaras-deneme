@@ -276,6 +276,20 @@ const PRIMARY_TRANSFER_PENALTY_MIN = 8;
 // çok büyük düz ceza gönderir; o çağrıda moda bakılmaz.
 const BUS_TO_METRO_TRANSFER_PENALTY_MIN = 2;
 const BUS_TO_BUS_TRANSFER_PENALTY_MIN = 14;
+// Gündüz aramasında gece hatları (numarası -7 ile biten, ya da adında
+// "gece" geçen hatlar) seçilmesin. Ceza yalnızca arama maliyetine eklenir;
+// gösterilen süreye girmez. "En Az Aktarmalı" her binişe 2000 dk yazdığı
+// için 120 dk'lık bir ceza, 0 aktarmalı gece hattını 1 aktarmalı gündüz
+// hattının önüne geçiriyordu (Panora → 411-7). 20000 dk, birkaç aktarmalı
+// gündüz yolunu da geride bırakır; gece hattı yalnızca gündüz hiç yol
+// yoksa yedek olarak kalır.
+const NIGHT_LINE_PENALTY_MIN = 20000;
+function isNightServiceLine(line) {
+  const hat = String((line && line.hatNo) || "");
+  const name = String((line && line.name) || "");
+  if (/-7$/.test(hat)) return true;
+  return /gece/i.test(hat) || /gece/i.test(name);
+}
 function selectiveTransferPenalty(basePenalty, fromMode, toMode) {
   if (basePenalty >= 100) return basePenalty;
   const toMetro = isMetroRide(toMode);
@@ -383,8 +397,12 @@ const WALK_TRANSFER_MAX_KM = 0.35; // farklı hatların yakın duraklarını "ak
 // güvenlik ağına düşüyordu. Tüm ilçe/mahalle/proje noktaları tarandı —
 // Pursaklar dışında en uzak nokta 1.34km'de, yani 2.0km başka bir yeri
 // etkilemiyor (bkz. proje notları).
-const NEAREST_STOP_SEARCH_KM = 2.0; // bir nokta çevresinde graf'a giriş/çıkış için aranan yarıçap
+const NEAREST_STOP_SEARCH_KM = 2.0; // varış tarafında durak arama yarıçapı
 const NEAREST_STOP_MAX_CANDIDATES = 10;
+// Adayın konumundan ilk biniş durağı en fazla 750 m. 1-2 km ötedeki
+// rastgele durağa yürüyen rotalar elenir. Proje tarafındaki iniş yürüyüşü
+// bu sınırın dışında kalır.
+const FIRST_BOARD_MAX_KM = 0.75;
 const WALK_STEP_MIN_KM = 0.12; // bundan kısa yürümeler ayrı adım olarak gösterilmez (süreye yine de dahil)
 const GRID_CELL_DEG = 0.006; // ~500-650m'lik ızgara hücresi (Ankara enleminde)
 
@@ -494,7 +512,7 @@ function buildTransitGraph(network, options) {
   });
 
   const adjacency = new Map();
-  const addEdge = (fromId, toId, minutes, lineId, mode, arterial, headwayMin, hatNo) => {
+  const addEdge = (fromId, toId, minutes, lineId, mode, arterial, headwayMin, hatNo, extra) => {
     if (!adjacency.has(fromId)) adjacency.set(fromId, []);
     adjacency.get(fromId).push({
       to: toId,
@@ -504,6 +522,8 @@ function buildTransitGraph(network, options) {
       arterial: arterial || false,
       headwayMin: headwayMin || 0,
       hatNo: hatNo || null,
+      km: extra && extra.km ? extra.km : 0,
+      night: !!(extra && extra.night),
     });
   };
 
@@ -526,8 +546,9 @@ function buildTransitGraph(network, options) {
       let minutes = (km / speed) * 60 + dwell;
       if (isMetroRide(line.mode, line.hatNo)) minutes *= METRO_TIME_FACTOR;
       const headwayMin = lineHeadwayMin(line);
-      addEdge(a.id, b.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo);
-      addEdge(b.id, a.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo);
+      const edgeExtra = { km, night: isNightServiceLine(line) };
+      addEdge(a.id, b.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo, edgeExtra);
+      addEdge(b.id, a.id, minutes, line.id, line.mode, arterial, headwayMin, line.hatNo, edgeExtra);
     }
   });
 
@@ -612,7 +633,7 @@ function stopsWithinRadius(graph, lat, lng, radiusKm, requireReliableCoord) {
  * göre yapılır ama GERÇEK süre (ceza hariç) ayrıca realMinutes'ta tutulur —
  * kullanıcıya cezalı/uydurma bir süre asla gösterilmez.
  */
-function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null) {
+function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null, progressOrigin = null, limitFirstWalk = false) {
   const NONE = " "; // henüz hiçbir hatta binilmemiş/sadece yürünüyor durumu
   const dist = new Map(); // "stopId|lineKey" -> sıralama için kullanılan (cezalı olabilir) dakika
   const realDist = new Map(); // "stopId|lineKey" -> GERÇEK dakika (ceza hariç)
@@ -639,7 +660,7 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       dist.set(key, startMinutes);
       realDist.set(key, realStartMinutes);
       keyStopId.set(key, stopId);
-      heap.push({ stopId, lineKey: NONE, minutes: startMinutes, rideHat: null, rideMode: null });
+      heap.push({ stopId, lineKey: NONE, minutes: startMinutes, rideHat: null, rideMode: null, busKm: 0 });
       relaxBestAtStop(stopId, key, startMinutes, realStartMinutes);
     }
   });
@@ -663,6 +684,10 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       let waitCost = 0;
       let newLineKey;
       const boarding = e.lineId && curLine !== e.lineId;
+      if (!e.lineId && limitFirstWalk && !cur.rideMode && progressOrigin) {
+        const walkStop = graph.stopsById.get(e.to);
+        if (walkStop && haversineKm(progressOrigin, { lat: walkStop.lat, lng: walkStop.lng }) > FIRST_BOARD_MAX_KM) return;
+      }
       if (e.lineId) {
         if (boarding) waitCost = boardingWaitMin(e.headwayMin);
         newLineKey = e.lineId;
@@ -687,7 +712,20 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
         if (boarding) chainPenalty = inceKChainPenalty(nextRideHat, e.hatNo, originCoords);
         nextRideHat = e.hatNo;
       }
-      const newMinutes = cur.minutes + e.minutes * (e.lineId ? 1 : WALK_PENALTY_FACTOR) + waitCost + penalty + chainPenalty;
+      if (boarding && e.night) penalty += NIGHT_LINE_PENALTY_MIN;
+      let nextBusKm = 0;
+      if (isBusRide(e.mode) && e.lineId) {
+        nextBusKm = boarding ? e.km || 0 : (cur.busKm || 0) + (e.km || 0);
+      }
+      let detourPenalty = 0;
+      if (isBusRide(e.mode) && progressOrigin && nextBusKm > 6) {
+        const arrived = graph.stopsById.get(e.to);
+        if (arrived) {
+          const crow = haversineKm(progressOrigin, { lat: arrived.lat, lng: arrived.lng });
+          if (nextBusKm > crow * 2.2 + 2) detourPenalty = (nextBusKm - crow) * 2;
+        }
+      }
+      const newMinutes = cur.minutes + e.minutes * (e.lineId ? 1 : WALK_PENALTY_FACTOR) + waitCost + penalty + chainPenalty + detourPenalty;
       const newRealMinutes = curRealMinutes + e.minutes + waitCost;
       const newKey = e.to + "|" + newLineKey;
       const known = dist.get(newKey);
@@ -696,7 +734,7 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
         realDist.set(newKey, newRealMinutes);
         keyStopId.set(newKey, e.to);
         prev.set(newKey, { fromKey: curKey, lineId: e.lineId, mode: e.mode });
-        heap.push({ stopId: e.to, lineKey: newLineKey, minutes: newMinutes, rideHat: nextRideHat, rideMode: nextRideMode });
+        heap.push({ stopId: e.to, lineKey: newLineKey, minutes: newMinutes, rideHat: nextRideHat, rideMode: nextRideMode, busKm: nextBusKm });
         relaxBestAtStop(e.to, newKey, newMinutes, newRealMinutes);
       }
     });
@@ -717,9 +755,9 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
 // kılıp (thrashing) her ikisini de her seferinde sıfırdan koştururdu.
 const dijkstraCacheByGraph = new Map();
 
-function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, feedOrigin = null) {
+function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, feedOrigin = null, sourceWalkKm = NEAREST_STOP_SEARCH_KM, limitFirstWalk = false) {
   const key = coords.lat.toFixed(4) + "," + coords.lng.toFixed(4);
-  const variant = (transferPenaltyMin || 0) + (feedOrigin ? ":feed" : "");
+  const variant = `${transferPenaltyMin || 0}:${feedOrigin ? "feed" : ""}:${sourceWalkKm}:${limitFirstWalk ? 1 : 0}`;
   let variants = dijkstraCacheByGraph.get(graph);
   if (!variants) {
     variants = new Map();
@@ -727,10 +765,10 @@ function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, f
   }
   const cached = variants.get(variant);
   if (cached && cached.key === key) return cached.result;
-  const sources = stopsWithinRadius(graph, coords.lat, coords.lng, NEAREST_STOP_SEARCH_KM, true)
+  const sources = stopsWithinRadius(graph, coords.lat, coords.lng, sourceWalkKm, true)
     .slice(0, NEAREST_STOP_MAX_CANDIDATES)
     .map(({ stop, km }) => ({ stopId: stop.id, startMinutes: walkMinutes(km) * WALK_PENALTY_FACTOR, realStart: walkMinutes(km) }));
-  const result = runDijkstra(graph, sources, transferPenaltyMin, feedOrigin);
+  const result = runDijkstra(graph, sources, transferPenaltyMin, feedOrigin, coords, limitFirstWalk);
   variants.set(variant, { key, result });
   return result;
 }
@@ -756,13 +794,18 @@ function findRealRoute(originCoords, destCoords, graph = transitGraph, fixedSide
   if (!graph) return null;
   const fromCoords = fixedSide === "dest" ? destCoords : originCoords;
   const toCoords = fixedSide === "dest" ? originCoords : destCoords;
+  const candidateIsSource = fixedSide !== "dest";
+  const sourceWalkKm = candidateIsSource ? FIRST_BOARD_MAX_KM : NEAREST_STOP_SEARCH_KM;
+  const targetWalkKm = candidateIsSource ? NEAREST_STOP_SEARCH_KM : FIRST_BOARD_MAX_KM;
   const { prev, keyStopId, bestAtStop, bestStateAtStop, bestRealMinutesAtStop } = getDijkstraFrom(
     fromCoords,
     graph,
     transferPenaltyMin,
-    fixedSide === "dest" ? null : originCoords
+    fixedSide === "dest" ? null : originCoords,
+    sourceWalkKm,
+    candidateIsSource
   );
-  const toCandidates = stopsWithinRadius(graph, toCoords.lat, toCoords.lng, NEAREST_STOP_SEARCH_KM, true).slice(
+  const toCandidates = stopsWithinRadius(graph, toCoords.lat, toCoords.lng, targetWalkKm, true).slice(
     0,
     NEAREST_STOP_MAX_CANDIDATES
   );
@@ -1034,7 +1077,7 @@ function buildMinTransfersAlternative(origin, dest, originLabel, destLabel, prim
 // ---------------------------------------------------------------------------
 
 const TransitCache = {
-  KEY: "ik_ulasim_cache_v32", // v32: metro segment süresi 0.65, otobüs-metro aktarma cezası düşük. v31: kapı durağı önceliği.
+  KEY: "ik_ulasim_cache_v34", // v34: gece (-7) cezası En Az Aktarmalı'yı da ezer. v33: ilk biniş 750 m.
   _mem: null,
   _load() {
     if (this._mem) return this._mem;
@@ -1610,8 +1653,11 @@ function routeUsesMetro(row) {
   return (row.steps || []).some((step) => isMetroRide(step.mode, step.line));
 }
 function fastestRankScore(row) {
-  const minutes = Number(row.durationMin) || 0;
-  return routeUsesMetro(row) ? minutes * METRO_RANK_FACTOR : minutes;
+  let minutes = Number(row.durationMin) || 0;
+  if (routeUsesMetro(row)) minutes *= METRO_RANK_FACTOR;
+  // Yakın duraktan binen tek aktarmalı rota, 0 aktarmalı uzun tura göre öne gelir.
+  if (row.transfers === 1) minutes *= 0.92;
+  return minutes;
 }
 
 function durationBucket(min) {
