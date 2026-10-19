@@ -6,10 +6,12 @@
 <title>İK Ulaşım &amp; Proje Eşleştirme Modülü</title>
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
@@ -141,6 +143,52 @@
   .leaflet-control-zoom { border-radius: 0.6rem !important; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.15) !important; border: none !important; }
   .leaflet-control-zoom a { border-radius: 0 !important; }
   .leaflet-control-attribution { border-radius: 0.4rem 0 0 0; font-size: 10px !important; }
+
+  /* leaflet-routing-machine'in adım adım yol tarifi kutusu bu uygulamada
+     kullanılmıyor (sol panel zaten rota detayını gösteriyor). Çizgi harita
+     katmanına eklenir; kutu kapalı olsa da dar ekranda tüm haritayı
+     kaplayabildiği için tamamen gizlenir. */
+  .leaflet-routing-container { display: none !important; }
+
+  .osrm-pick-control {
+    background: white;
+    border-radius: 0.6rem;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15);
+    overflow: hidden;
+    border: none;
+  }
+  .osrm-pick-btn,
+  .osrm-use-selected {
+    display: block;
+    width: 100%;
+    border: none;
+    background: white;
+    color: #1e293b;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 0.45rem 0.7rem;
+    cursor: pointer;
+    line-height: 1.2;
+    text-align: left;
+  }
+  .osrm-pick-btn-active { background: #1a56db; color: white; }
+  .osrm-use-selected {
+    border-top: 1px solid #e2e8f0;
+    color: #1a56db;
+    font-weight: 600;
+  }
+  .osrm-use-selected:hover { background: #eff6ff; }
+  .osrm-pick-status {
+    display: none;
+    max-width: 190px;
+    padding: 0.35rem 0.65rem 0.45rem;
+    font-size: 11px;
+    color: #475569;
+    line-height: 1.35;
+    border-top: 1px solid #e2e8f0;
+  }
+  .osrm-pick-status.is-visible { display: block; }
+  .osrm-hidden { display: none !important; }
 
   .marker-cluster-custom {
     background: rgba(79, 70, 229, 0.18);
@@ -534,7 +582,7 @@
 
 <script src="data.js?v=57"></script>
 <script src="live_bus.js?v=1"></script>
-<script src="app.js?v=95"></script>
+<script src="app.js?v=97"></script>
 <script src="candidates.js?v=14"></script>
 </body>
 </html>

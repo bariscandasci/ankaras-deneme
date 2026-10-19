@@ -1678,6 +1678,277 @@ function districtIcon(color) {
 let markersLayer = L.layerGroup().addTo(map);
 let routesLayer = L.layerGroup().addTo(map);
 
+// Gerçek yol ağını takip eden OSRM rotası (leaflet-routing-machine).
+// Başlangıç/bitiş ya hazır koordinat olarak ya da haritaya tıklanan iki
+// nokta olarak verilir. Her yeni çizimde önce eski kontrol (ve onun
+// çizgisi) kaldırılır, sonra sıfırdan bir rota kurulur — önceki çizgi
+// ekranda kalmaz.
+const OSRM_ROUTE_COLOR = "#1a56db";
+const OSRM_SERVICE_URL = "https://routing.openstreetmap.de/routed-car/route/v1";
+let osrmRoutingControl = null;
+let osrmPickEnabled = false;
+let osrmClickPoints = [];
+let osrmPickMarker = null;
+let osrmPendingClick = null;
+let osrmPickStatusEl = null;
+let osrmUseSelectedBtn = null;
+let osrmPickBtn = null;
+// drawRoute'un son çizdiği başlangıç/bitiş. "Seçili noktalar" bu çifti
+// karayolu rotasına çevirir.
+let lastRouteEndpoints = null;
+
+function isRouteLatLng(point) {
+  return !!point && Number.isFinite(point.lat) && Number.isFinite(point.lng);
+}
+
+function updateOsrmPickStatus(message) {
+  if (osrmPickBtn) osrmPickBtn.classList.toggle("osrm-pick-btn-active", osrmPickEnabled);
+  if (osrmPickBtn) osrmPickBtn.setAttribute("aria-pressed", osrmPickEnabled ? "true" : "false");
+  map.getContainer().style.cursor = osrmPickEnabled ? "crosshair" : "";
+  if (osrmUseSelectedBtn) {
+    osrmUseSelectedBtn.classList.toggle("osrm-hidden", !(osrmPickEnabled && lastRouteEndpoints));
+  }
+  if (!osrmPickStatusEl) return;
+  // Seçim modu kapanınca hesaplanmış mesafe yazısı durur. Rota haritadan
+  // kalkınca (clearOsrmRoute) özet de silinir.
+  if (message == null && !osrmPickEnabled && osrmRoutingControl) return;
+  let text = message || "";
+  if (!text && osrmPickEnabled) {
+    text = osrmClickPoints.length === 0
+      ? "Başlangıç için haritaya tıklayın."
+      : "Bitiş için haritaya tıklayın.";
+  }
+  osrmPickStatusEl.textContent = text;
+  osrmPickStatusEl.classList.toggle("is-visible", text.length > 0);
+}
+
+function clearOsrmPickPoint() {
+  osrmClickPoints = [];
+  if (osrmPendingClick) {
+    clearTimeout(osrmPendingClick.timer);
+    osrmPendingClick = null;
+  }
+  if (osrmPickMarker) {
+    map.removeLayer(osrmPickMarker);
+    osrmPickMarker = null;
+  }
+}
+
+function removeOsrmRoutingControl() {
+  const control = osrmRoutingControl;
+  if (!control) return;
+  osrmRoutingControl = null;
+  if (control._osrmGuard) control._osrmGuard.generation += 1;
+  try {
+    map.removeControl(control);
+  } catch (e) {
+    // Kontrol zaten haritadan kalkmış olabilir.
+  }
+}
+
+function clearOsrmRoute() {
+  removeOsrmRoutingControl();
+  clearOsrmPickPoint();
+  updateOsrmPickStatus();
+}
+
+function drawOsrmRoute(start, end) {
+  if (typeof L.Routing === "undefined" || !L.Routing.control || !L.Routing.osrmv1) return;
+  if (!isRouteLatLng(start) || !isRouteLatLng(end)) return;
+  if (Math.abs(start.lat - end.lat) < 1e-5 && Math.abs(start.lng - end.lng) < 1e-5) {
+    updateOsrmPickStatus("Bitiş, başlangıçtan farklı bir nokta olmalı.");
+    return;
+  }
+
+  // Eski karayolu rotasını ve varsa toplu taşıma çizgisini kaldır, sonra
+  // yalnızca bu yeni rotayı kur. Gecikmiş yürüyüş/araç geometrisi cevabı
+  // artık ekranda olmayan bir çizgiyi güncellemesin.
+  removeOsrmRoutingControl();
+  clearOsrmPickPoint();
+  routesLayer.clearLayers();
+  routeDrawToken += 1;
+  setBackgroundMarkersVisible(true);
+
+  const guard = { generation: 0 };
+  const innerRouter = L.Routing.osrmv1({
+    serviceUrl: OSRM_SERVICE_URL,
+    profile: "driving",
+    timeout: 12000,
+    suppressDemoServerWarning: true,
+    useHints: false,
+  });
+  const router = {
+    route(waypoints, callback, context, options) {
+      const generation = guard.generation;
+      return innerRouter.route(waypoints, function (err, routes) {
+        if (generation !== guard.generation) return;
+        callback.call(context, err, routes);
+      }, context, options);
+    },
+    requiresMoreDetail(route, zoom, bounds) {
+      return innerRouter.requiresMoreDetail(route, zoom, bounds);
+    },
+  };
+
+  updateOsrmPickStatus("Rota hesaplanıyor…");
+  const control = L.Routing.control({
+    waypoints: [L.latLng(start.lat, start.lng), L.latLng(end.lat, end.lng)],
+    router,
+    lineOptions: {
+      styles: [
+        { color: "#ffffff", opacity: 0.95, weight: 9 },
+        { color: OSRM_ROUTE_COLOR, opacity: 1, weight: 5 },
+      ],
+      // OSRM noktayı en yakın yola çeker. İşaretle yol arasındaki kısa
+      // bağ da aynı mavi çizgi olsun; kütüphanenin gri varsayılanı
+      // rotadan kopuk bir kanca gibi duruyordu.
+      missingRouteStyles: [
+        { color: "#ffffff", opacity: 0.95, weight: 9 },
+        { color: OSRM_ROUTE_COLOR, opacity: 1, weight: 5 },
+      ],
+      addWaypoints: false,
+    },
+    altLineOptions: { styles: [{ opacity: 0, weight: 0 }] },
+    fitSelectedRoutes: false,
+    show: false,
+    collapsible: false,
+    addWaypoints: false,
+    draggableWaypoints: false,
+    routeWhileDragging: false,
+    showAlternatives: false,
+    useZoomParameter: false,
+    createMarker(index, waypoint) {
+      const isStart = index === 0;
+      return L.circleMarker(waypoint.latLng, {
+        radius: 7,
+        color: isStart ? OSRM_ROUTE_COLOR : "#ea4335",
+        weight: 3,
+        fillColor: "#ffffff",
+        fillOpacity: 1,
+      }).bindTooltip(isStart ? "Başlangıç" : "Bitiş", { direction: "top" });
+    },
+  });
+  control._osrmGuard = guard;
+  control.on("routesfound", (event) => {
+    if (osrmRoutingControl !== control) return;
+    const route = event.routes && event.routes[0];
+    const coords = route && route.coordinates;
+    if (coords && coords.length > 1) {
+      map.fitBounds(L.latLngBounds(coords), { padding: [70, 70], animate: true, duration: 0.8 });
+    }
+    if (route && route.summary) {
+      const km = (route.summary.totalDistance / 1000).toLocaleString("tr-TR", {
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1,
+      });
+      const minutes = Math.max(1, Math.round(route.summary.totalTime / 60));
+      updateOsrmPickStatus(`Karayolu rotası · ${km} km · ~${minutes} dk`);
+    } else {
+      updateOsrmPickStatus("Karayolu rotası çizildi.");
+    }
+  });
+  control.on("routingerror", () => {
+    if (osrmRoutingControl !== control) return;
+    updateOsrmPickStatus("Bu noktalar arasında yol rotası bulunamadı.");
+  });
+  osrmRoutingControl = control;
+  try {
+    control.addTo(map);
+  } catch (e) {
+    osrmRoutingControl = null;
+    updateOsrmPickStatus("Rota çizilemedi.");
+  }
+}
+
+function handleOsrmMapClick(latlng) {
+  if (!osrmPickEnabled || !latlng) return;
+  if (osrmClickPoints.length === 0) {
+    osrmClickPoints.push(latlng);
+    if (osrmPickMarker) map.removeLayer(osrmPickMarker);
+    osrmPickMarker = L.circleMarker(latlng, {
+      radius: 7,
+      color: OSRM_ROUTE_COLOR,
+      weight: 3,
+      fillColor: "#ffffff",
+      fillOpacity: 1,
+    })
+      .bindTooltip("Başlangıç", { direction: "top", permanent: true })
+      .addTo(map);
+    updateOsrmPickStatus();
+    return;
+  }
+  const start = osrmClickPoints[0];
+  drawOsrmRoute(start, latlng);
+}
+
+// Çift tıklama haritayı yakınlaştırır ve peş peşe iki click üretir. Aynı
+// noktadaki çift tıklama rota seçimi sayılmaz; birbirinden ayrı iki hızlı
+// tıklama ise başlangıç ve bitiş olarak işlenir.
+function osrmClicksAreDistinct(a, b) {
+  const p1 = map.latLngToContainerPoint(a);
+  const p2 = map.latLngToContainerPoint(b);
+  const dx = p1.x - p2.x;
+  const dy = p1.y - p2.y;
+  return dx * dx + dy * dy > 16;
+}
+map.on("click", (event) => {
+  if (!osrmPickEnabled) return;
+  const latlng = event.latlng;
+  if (osrmPendingClick && !osrmClicksAreDistinct(osrmPendingClick.latlng, latlng)) {
+    clearTimeout(osrmPendingClick.timer);
+    osrmPendingClick = null;
+    return;
+  }
+  if (osrmPendingClick) {
+    clearTimeout(osrmPendingClick.timer);
+    handleOsrmMapClick(osrmPendingClick.latlng);
+  }
+  osrmPendingClick = {
+    latlng,
+    timer: setTimeout(() => {
+      const chosen = osrmPendingClick && osrmPendingClick.latlng;
+      osrmPendingClick = null;
+      if (chosen) handleOsrmMapClick(chosen);
+    }, 280),
+  };
+});
+map.on("dblclick", () => {
+  if (!osrmPendingClick) return;
+  clearTimeout(osrmPendingClick.timer);
+  osrmPendingClick = null;
+});
+
+const osrmPickControl = L.control({ position: "topright" });
+osrmPickControl.onAdd = function () {
+  const wrap = L.DomUtil.create("div", "osrm-pick-control");
+  const btn = L.DomUtil.create("button", "osrm-pick-btn", wrap);
+  btn.type = "button";
+  btn.textContent = "Yol rotası";
+  btn.title = "Haritada iki noktaya tıklayarak yollara oturan mavi rota çiz";
+  osrmPickBtn = btn;
+  osrmPickStatusEl = L.DomUtil.create("div", "osrm-pick-status", wrap);
+  const useSelected = L.DomUtil.create("button", "osrm-use-selected osrm-hidden", wrap);
+  useSelected.type = "button";
+  useSelected.textContent = "Seçili noktalar";
+  useSelected.title = "Son seçilen başlangıç ve bitiş arasında karayolu rotası çiz";
+  osrmUseSelectedBtn = useSelected;
+  L.DomEvent.disableClickPropagation(wrap);
+  L.DomEvent.disableScrollPropagation(wrap);
+  L.DomEvent.on(btn, "click", (event) => {
+    L.DomEvent.stop(event);
+    osrmPickEnabled = !osrmPickEnabled;
+    if (!osrmPickEnabled) clearOsrmPickPoint();
+    updateOsrmPickStatus();
+  });
+  L.DomEvent.on(useSelected, "click", (event) => {
+    L.DomEvent.stop(event);
+    if (!lastRouteEndpoints) return;
+    drawOsrmRoute(lastRouteEndpoints.start, lastRouteEndpoints.end);
+  });
+  return wrap;
+};
+osrmPickControl.addTo(map);
+
 // Proje pinleri (53 adet) çok kalabalık olduğundan (ör. Bilkent'te 15+ proje
 // üst üste biniyor) kümeleme kullanıyoruz: yakınlaşınca otomatik ayrışırlar.
 const projectCluster = L.markerClusterGroup({
@@ -2026,6 +2297,8 @@ function renderNearbyLinesPanel(originId) {
 
 function clearResults() {
   resultsList.innerHTML = "";
+  lastRouteEndpoints = null;
+  if (osrmUseSelectedBtn) osrmUseSelectedBtn.classList.add("osrm-hidden");
   routesLayer.clearLayers();
   routeDetail.classList.add("hidden");
   emptyState.classList.remove("hidden");
@@ -2058,6 +2331,7 @@ function runSearch() {
 
 function renderOriginToProject(originId) {
   const rows = rankProjectsForOrigin(originId, currentThreshold);
+  lastRouteEndpoints = null;
   routesLayer.clearLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
@@ -2115,6 +2389,7 @@ function renderOriginToProject(originId) {
 
 function renderProjectToOrigin(projectId) {
   const rows = rankDistrictsForProject(projectId, currentThreshold);
+  lastRouteEndpoints = null;
   routesLayer.clearLayers();
   resetDistrictMarkers();
   emptyState.classList.toggle("hidden", rows.length > 0);
@@ -2602,11 +2877,19 @@ function setBackgroundMarkersVisible(visible) {
 }
 
 function drawRoute(originCoords, row, bucket, destCoordsOverride) {
+  clearOsrmRoute();
   routesLayer.clearLayers();
   setBackgroundMarkersVisible(false);
   routeDrawToken += 1;
   const myToken = routeDrawToken;
   const destCoords = destCoordsOverride || { lat: row.project.lat, lng: row.project.lng };
+  if (isRouteLatLng(originCoords) && isRouteLatLng(destCoords)) {
+    lastRouteEndpoints = {
+      start: { lat: originCoords.lat, lng: originCoords.lng },
+      end: { lat: destCoords.lat, lng: destCoords.lng },
+    };
+    updateOsrmPickStatus();
+  }
   const steps = row.steps || [];
   if (steps.length === 0) return;
 
