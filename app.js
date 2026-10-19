@@ -397,12 +397,26 @@ const WALK_TRANSFER_MAX_KM = 0.35; // farklı hatların yakın duraklarını "ak
 // güvenlik ağına düşüyordu. Tüm ilçe/mahalle/proje noktaları tarandı —
 // Pursaklar dışında en uzak nokta 1.34km'de, yani 2.0km başka bir yeri
 // etkilemiyor (bkz. proje notları).
-const NEAREST_STOP_SEARCH_KM = 2.0; // varış tarafında durak arama yarıçapı
+const NEAREST_STOP_SEARCH_KM = 2.0; // getDijkstraFrom varsayılanı; rota uçları daha sıkı
 const NEAREST_STOP_MAX_CANDIDATES = 10;
 // Adayın konumundan ilk biniş durağı en fazla 750 m. 1-2 km ötedeki
-// rastgele durağa yürüyen rotalar elenir. Proje tarafındaki iniş yürüyüşü
-// bu sınırın dışında kalır.
+// rastgele durağa yürüyen rotalar elenir.
 const FIRST_BOARD_MAX_KM = 0.75;
+// Son araç inişi ile proje arası en fazla 800 m. Otobüs 2 km ötede indirip
+// kalanı yürütüyorsa (725 → Halk Ekmek gibi) o rota elenir. Araçtan indikten
+// sonra daha yakın bir durağa yürümek bu mesafeyi kısaltmaz: ölçüm, inilen
+// son araç durağındandır.
+const LAST_ALIGHT_MAX_KM = 0.8;
+// Erişim, aktarma ve iniş yürüyüşlerinin toplamı 15 dk'yı geçerse arama
+// maliyetine (gösterilen süreye değil) tek seferlik yüksek ceza eklenir.
+// Gece hattı cezasının (20000) altında kalır; yoksa son 200 m için -7 hattı
+// gündüz yolunu ezer.
+const LONG_WALK_LIMIT_MIN = 15;
+const LONG_WALK_PENALTY_MIN = 480;
+function longWalkPenalty(beforeMin, afterMin) {
+  if ((beforeMin || 0) <= LONG_WALK_LIMIT_MIN && afterMin > LONG_WALK_LIMIT_MIN) return LONG_WALK_PENALTY_MIN;
+  return 0;
+}
 const WALK_STEP_MIN_KM = 0.12; // bundan kısa yürümeler ayrı adım olarak gösterilmez (süreye yine de dahil)
 const GRID_CELL_DEG = 0.006; // ~500-650m'lik ızgara hücresi (Ankara enleminde)
 
@@ -633,7 +647,7 @@ function stopsWithinRadius(graph, lat, lng, radiusKm, requireReliableCoord) {
  * göre yapılır ama GERÇEK süre (ceza hariç) ayrıca realMinutes'ta tutulur —
  * kullanıcıya cezalı/uydurma bir süre asla gösterilmez.
  */
-function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null, progressOrigin = null, limitFirstWalk = false) {
+function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null, progressOrigin = null, firstWalkMaxKm = 0) {
   const NONE = " "; // henüz hiçbir hatta binilmemiş/sadece yürünüyor durumu
   const dist = new Map(); // "stopId|lineKey" -> sıralama için kullanılan (cezalı olabilir) dakika
   const realDist = new Map(); // "stopId|lineKey" -> GERÇEK dakika (ceza hariç)
@@ -642,14 +656,37 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
   const bestAtStop = new Map(); // stopId -> tüm hat-durumları arasında en iyi (cezalı olabilir) dakika
   const bestStateAtStop = new Map(); // stopId -> o en iyiye ulaşan durum anahtarı
   const bestRealMinutesAtStop = new Map(); // stopId -> o en iyiye karşılık gelen GERÇEK süre
+  const bestWalkMinAtStop = new Map();
+  const bestBoardStopAtStop = new Map();
+  const bestAlightStopAtStop = new Map();
+  // Aynı durağa araçla inen en iyi durum. Yürüyerek "kapıya" yaklaşmak bu
+  // kaydın üzerine yazamaz; iniş mesafesi araç durağından ölçülür.
+  const bestRideAtStop = new Map();
   const heap = new MinHeap();
 
-  function relaxBestAtStop(stopId, key, minutes, realMinutes) {
+  function relaxBestAtStop(stopId, key, minutes, realMinutes, walkMin, boardStopId, alightStopId) {
     const cur = bestAtStop.get(stopId);
     if (cur === undefined || minutes < cur - 1e-9) {
       bestAtStop.set(stopId, minutes);
       bestStateAtStop.set(stopId, key);
       bestRealMinutesAtStop.set(stopId, realMinutes);
+      bestWalkMinAtStop.set(stopId, walkMin || 0);
+      bestBoardStopAtStop.set(stopId, boardStopId || null);
+      bestAlightStopAtStop.set(stopId, alightStopId || null);
+    }
+  }
+
+  function relaxBestRide(stopId, key, minutes, realMinutes, walkMin, boardStopId, alightStopId) {
+    const cur = bestRideAtStop.get(stopId);
+    if (!cur || minutes < cur.minutes - 1e-9) {
+      bestRideAtStop.set(stopId, {
+        minutes,
+        realMinutes,
+        key,
+        walkMin: walkMin || 0,
+        boardStopId: boardStopId || null,
+        alightStopId: alightStopId || null,
+      });
     }
   }
 
@@ -660,8 +697,18 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       dist.set(key, startMinutes);
       realDist.set(key, realStartMinutes);
       keyStopId.set(key, stopId);
-      heap.push({ stopId, lineKey: NONE, minutes: startMinutes, rideHat: null, rideMode: null, busKm: 0 });
-      relaxBestAtStop(stopId, key, startMinutes, realStartMinutes);
+      heap.push({
+        stopId,
+        lineKey: NONE,
+        minutes: startMinutes,
+        rideHat: null,
+        rideMode: null,
+        busKm: 0,
+        walkMin: realStartMinutes,
+        boardStopId: null,
+        alightStopId: null,
+      });
+      relaxBestAtStop(stopId, key, startMinutes, realStartMinutes, realStartMinutes, null, null);
     }
   });
 
@@ -684,9 +731,9 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
       let waitCost = 0;
       let newLineKey;
       const boarding = e.lineId && curLine !== e.lineId;
-      if (!e.lineId && limitFirstWalk && !cur.rideMode && progressOrigin) {
+      if (!e.lineId && firstWalkMaxKm > 0 && !cur.rideMode && progressOrigin) {
         const walkStop = graph.stopsById.get(e.to);
-        if (walkStop && haversineKm(progressOrigin, { lat: walkStop.lat, lng: walkStop.lng }) > FIRST_BOARD_MAX_KM) return;
+        if (walkStop && haversineKm(progressOrigin, { lat: walkStop.lat, lng: walkStop.lng }) > firstWalkMaxKm) return;
       }
       if (e.lineId) {
         if (boarding) waitCost = boardingWaitMin(e.headwayMin);
@@ -713,6 +760,11 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
         nextRideHat = e.hatNo;
       }
       if (boarding && e.night) penalty += NIGHT_LINE_PENALTY_MIN;
+      const curWalk = cur.walkMin || 0;
+      const nextWalk = e.lineId ? curWalk : curWalk + e.minutes;
+      const nextBoard = boarding && !cur.boardStopId ? cur.stopId : (cur.boardStopId || null);
+      const nextAlight = e.lineId ? e.to : (cur.alightStopId || null);
+      const walkPenalty = longWalkPenalty(curWalk, nextWalk);
       let nextBusKm = 0;
       if (isBusRide(e.mode) && e.lineId) {
         nextBusKm = boarding ? e.km || 0 : (cur.busKm || 0) + (e.km || 0);
@@ -725,7 +777,7 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
           if (nextBusKm > crow * 2.2 + 2) detourPenalty = (nextBusKm - crow) * 2;
         }
       }
-      const newMinutes = cur.minutes + e.minutes * (e.lineId ? 1 : WALK_PENALTY_FACTOR) + waitCost + penalty + chainPenalty + detourPenalty;
+      const newMinutes = cur.minutes + e.minutes * (e.lineId ? 1 : WALK_PENALTY_FACTOR) + waitCost + penalty + chainPenalty + detourPenalty + walkPenalty;
       const newRealMinutes = curRealMinutes + e.minutes + waitCost;
       const newKey = e.to + "|" + newLineKey;
       const known = dist.get(newKey);
@@ -734,12 +786,33 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
         realDist.set(newKey, newRealMinutes);
         keyStopId.set(newKey, e.to);
         prev.set(newKey, { fromKey: curKey, lineId: e.lineId, mode: e.mode });
-        heap.push({ stopId: e.to, lineKey: newLineKey, minutes: newMinutes, rideHat: nextRideHat, rideMode: nextRideMode, busKm: nextBusKm });
-        relaxBestAtStop(e.to, newKey, newMinutes, newRealMinutes);
+        heap.push({
+          stopId: e.to,
+          lineKey: newLineKey,
+          minutes: newMinutes,
+          rideHat: nextRideHat,
+          rideMode: nextRideMode,
+          busKm: nextBusKm,
+          walkMin: nextWalk,
+          boardStopId: nextBoard,
+          alightStopId: nextAlight,
+        });
+        relaxBestAtStop(e.to, newKey, newMinutes, newRealMinutes, nextWalk, nextBoard, nextAlight);
+        if (e.lineId) relaxBestRide(e.to, newKey, newMinutes, newRealMinutes, nextWalk, nextBoard, nextAlight);
       }
     });
   }
-  return { prev, keyStopId, bestAtStop, bestStateAtStop, bestRealMinutesAtStop };
+  return {
+    prev,
+    keyStopId,
+    bestAtStop,
+    bestStateAtStop,
+    bestRealMinutesAtStop,
+    bestWalkMinAtStop,
+    bestBoardStopAtStop,
+    bestAlightStopAtStop,
+    bestRideAtStop,
+  };
 }
 
 // rankProjectsForOrigin/rankDistrictsForProject tek bir tarafı sabit tutup
@@ -755,9 +828,9 @@ function runDijkstra(graph, sources, transferPenaltyMin = 0, originCoords = null
 // kılıp (thrashing) her ikisini de her seferinde sıfırdan koştururdu.
 const dijkstraCacheByGraph = new Map();
 
-function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, feedOrigin = null, sourceWalkKm = NEAREST_STOP_SEARCH_KM, limitFirstWalk = false) {
+function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, feedOrigin = null, sourceWalkKm = NEAREST_STOP_SEARCH_KM) {
   const key = coords.lat.toFixed(4) + "," + coords.lng.toFixed(4);
-  const variant = `${transferPenaltyMin || 0}:${feedOrigin ? "feed" : ""}:${sourceWalkKm}:${limitFirstWalk ? 1 : 0}`;
+  const variant = `${transferPenaltyMin || 0}:${feedOrigin ? "feed" : ""}:${sourceWalkKm}`;
   let variants = dijkstraCacheByGraph.get(graph);
   if (!variants) {
     variants = new Map();
@@ -768,7 +841,7 @@ function getDijkstraFrom(coords, graph = transitGraph, transferPenaltyMin = 0, f
   const sources = stopsWithinRadius(graph, coords.lat, coords.lng, sourceWalkKm, true)
     .slice(0, NEAREST_STOP_MAX_CANDIDATES)
     .map(({ stop, km }) => ({ stopId: stop.id, startMinutes: walkMinutes(km) * WALK_PENALTY_FACTOR, realStart: walkMinutes(km) }));
-  const result = runDijkstra(graph, sources, transferPenaltyMin, feedOrigin, coords, limitFirstWalk);
+  const result = runDijkstra(graph, sources, transferPenaltyMin, feedOrigin, coords, sourceWalkKm);
   variants.set(variant, { key, result });
   return result;
 }
@@ -795,44 +868,85 @@ function findRealRoute(originCoords, destCoords, graph = transitGraph, fixedSide
   const fromCoords = fixedSide === "dest" ? destCoords : originCoords;
   const toCoords = fixedSide === "dest" ? originCoords : destCoords;
   const candidateIsSource = fixedSide !== "dest";
-  const sourceWalkKm = candidateIsSource ? FIRST_BOARD_MAX_KM : NEAREST_STOP_SEARCH_KM;
-  const targetWalkKm = candidateIsSource ? NEAREST_STOP_SEARCH_KM : FIRST_BOARD_MAX_KM;
-  const { prev, keyStopId, bestAtStop, bestStateAtStop, bestRealMinutesAtStop } = getDijkstraFrom(
+  const sourceWalkKm = candidateIsSource ? FIRST_BOARD_MAX_KM : LAST_ALIGHT_MAX_KM;
+  const targetWalkKm = candidateIsSource ? LAST_ALIGHT_MAX_KM : FIRST_BOARD_MAX_KM;
+  const {
+    prev,
+    keyStopId,
+    bestAtStop,
+    bestStateAtStop,
+    bestRealMinutesAtStop,
+    bestWalkMinAtStop,
+    bestBoardStopAtStop,
+    bestAlightStopAtStop,
+    bestRideAtStop,
+  } = getDijkstraFrom(
     fromCoords,
     graph,
     transferPenaltyMin,
     fixedSide === "dest" ? null : originCoords,
-    sourceWalkKm,
-    candidateIsSource
+    sourceWalkKm
   );
   const toCandidates = stopsWithinRadius(graph, toCoords.lat, toCoords.lng, targetWalkKm, true).slice(
     0,
     NEAREST_STOP_MAX_CANDIDATES
   );
 
-  const hasDoorAlight = toCandidates.some((c) => c.km <= DOOR_ALIGHT_KM && bestAtStop.has(c.stop.id));
-  const hasCloseAlight = toCandidates.some((c) => c.km <= CLOSE_ALIGHT_KM && bestAtStop.has(c.stop.id));
-  let best = null;
+  const projectAnchor = candidateIsSource ? toCoords : fromCoords;
+  function vehicleAlightKm(state, atStopId) {
+    if (!state) return Infinity;
+    const stopId = candidateIsSource ? state.alightStopId : state.boardStopId;
+    const stop = stopId && graph.stopsById.get(stopId);
+    if (!stop) return Infinity;
+    return haversineKm({ lat: stop.lat, lng: stop.lng }, projectAnchor);
+  }
+  function stateAt(stopId, rideOnly) {
+    if (rideOnly) {
+      const ride = bestRideAtStop.get(stopId);
+      return ride || null;
+    }
+    if (!bestAtStop.has(stopId)) return null;
+    return {
+      minutes: bestAtStop.get(stopId),
+      realMinutes: bestRealMinutesAtStop.get(stopId),
+      key: bestStateAtStop.get(stopId),
+      walkMin: bestWalkMinAtStop.get(stopId) || 0,
+      boardStopId: bestBoardStopAtStop.get(stopId),
+      alightStopId: bestAlightStopAtStop.get(stopId),
+    };
+  }
+  const arrivalOptions = [];
   toCandidates.forEach(({ stop, km }) => {
-    const d = bestAtStop.get(stop.id);
-    if (d === undefined) return;
+    [false, true].forEach((rideOnly) => {
+      const state = stateAt(stop.id, rideOnly);
+      if (!state) return;
+      const alightKm = vehicleAlightKm(state, stop.id);
+      if (alightKm > LAST_ALIGHT_MAX_KM) return;
+      arrivalOptions.push({ stop, km, state, alightKm });
+    });
+  });
+  const hasDoorAlight = arrivalOptions.some((c) => c.alightKm <= DOOR_ALIGHT_KM);
+  const hasCloseAlight = arrivalOptions.some((c) => c.alightKm <= CLOSE_ALIGHT_KM);
+  let best = null;
+  arrivalOptions.forEach(({ stop, km, state, alightKm }) => {
     const walk = walkMinutes(km);
     let walkCost = walk * WALK_PENALTY_FACTOR;
-    if (hasDoorAlight && km > DOOR_ALIGHT_KM) {
-      walkCost += (km - DOOR_ALIGHT_KM) * DOOR_ALIGHT_MIN_PER_KM;
-    } else if (hasCloseAlight && km > CLOSE_ALIGHT_KM) {
-      walkCost += (km - CLOSE_ALIGHT_KM) * EARLY_ALIGHT_MIN_PER_KM;
+    if (hasDoorAlight && alightKm > DOOR_ALIGHT_KM) {
+      walkCost += (alightKm - DOOR_ALIGHT_KM) * DOOR_ALIGHT_MIN_PER_KM;
+    } else if (hasCloseAlight && alightKm > CLOSE_ALIGHT_KM) {
+      walkCost += (alightKm - CLOSE_ALIGHT_KM) * EARLY_ALIGHT_MIN_PER_KM;
     }
-    const total = d + walkCost;
+    const totalWalkMin = (state.walkMin || 0) + walk;
+    const total = state.minutes + walkCost + longWalkPenalty(state.walkMin || 0, totalWalkMin);
     if (!best || total < best.total) {
-      best = { total, stopId: stop.id, realTotal: bestRealMinutesAtStop.get(stop.id) + walk };
+      best = { total, stopId: stop.id, key: state.key, realTotal: state.realMinutes + walk, totalWalkMin };
     }
   });
   if (!best) return null;
 
   const pathStopIds = [];
   const edgeAtStop = new Map(); // varış durağı stopId -> o durağa gelirken kullanılan {lineId, mode}
-  let curKey = bestStateAtStop.get(best.stopId);
+  let curKey = best.key;
   while (curKey) {
     const stopId = keyStopId.get(curKey);
     pathStopIds.unshift(stopId);
@@ -842,7 +956,7 @@ function findRealRoute(originCoords, destCoords, graph = transitGraph, fixedSide
   }
 
   if (fixedSide !== "dest") {
-    return { totalMinutes: best.realTotal, pathStopIds, edgeAtStop };
+    return { totalMinutes: best.realTotal, pathStopIds, edgeAtStop, totalWalkMin: best.totalWalkMin };
   }
 
   // Dijkstra dest'ten koşturuldu; pathStopIds şu an dest->origin sırasında.
@@ -852,7 +966,7 @@ function findRealRoute(originCoords, destCoords, graph = transitGraph, fixedSide
   for (let i = 0; i < pathStopIds.length - 1; i++) {
     reversedEdgeAtStop.set(pathStopIds[i], edgeAtStop.get(pathStopIds[i + 1]));
   }
-  return { totalMinutes: best.realTotal, pathStopIds: reversedIds, edgeAtStop: reversedEdgeAtStop };
+  return { totalMinutes: best.realTotal, pathStopIds: reversedIds, edgeAtStop: reversedEdgeAtStop, totalWalkMin: best.totalWalkMin };
 }
 
 /** Bir durak dizisini (ve prev'deki hat bilgisini), ardışık aynı hattı tek adımda birleştirerek adımlara çevirir. */
@@ -976,7 +1090,7 @@ function estimateTransit(origin, dest, fixedSide = "origin") {
   const dolmusAlternative = buildDolmusAlternative(origin, dest, originLabel, destLabel, route.totalMinutes, fixedSide);
   const minTransfersAlternative = buildMinTransfersAlternative(origin, dest, originLabel, destLabel, transfers, durationMin, fixedSide);
 
-  return { durationMin, rawMinutes, transfers, routeSummary, steps, distanceKm, verified, dolmusAlternative, minTransfersAlternative };
+  return { durationMin, rawMinutes, transfers, routeSummary, steps, distanceKm, verified, totalWalkMin: route.totalWalkMin, dolmusAlternative, minTransfersAlternative };
 }
 
 // Ana rota SADECE resmi taşımayla (yukarıda) hesaplanır — dolmuş, resmi
@@ -1077,7 +1191,7 @@ function buildMinTransfersAlternative(origin, dest, originLabel, destLabel, prim
 // ---------------------------------------------------------------------------
 
 const TransitCache = {
-  KEY: "ik_ulasim_cache_v34", // v34: gece (-7) cezası En Az Aktarmalı'yı da ezer. v33: ilk biniş 750 m.
+  KEY: "ik_ulasim_cache_v36", // v36: 15 dk yürüyüş cezası gece hattını ezmesin. v35: son iniş 800 m.
   _mem: null,
   _load() {
     if (this._mem) return this._mem;
@@ -1657,6 +1771,7 @@ function fastestRankScore(row) {
   if (routeUsesMetro(row)) minutes *= METRO_RANK_FACTOR;
   // Yakın duraktan binen tek aktarmalı rota, 0 aktarmalı uzun tura göre öne gelir.
   if (row.transfers === 1) minutes *= 0.92;
+  if ((row.totalWalkMin || 0) > LONG_WALK_LIMIT_MIN) minutes += LONG_WALK_PENALTY_MIN;
   return minutes;
 }
 
